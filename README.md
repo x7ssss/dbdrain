@@ -2,7 +2,7 @@
 
 # 🚰 dbdrain
 
-**Zero-downtime PostgreSQL database subsetting & deterministic PII anonymization — in a single static binary.**
+**Zero-downtime PostgreSQL database subsetting, polymorphic FK resolution & deterministic PII masking — in a single static binary.**
 
 [![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)](https://go.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -22,13 +22,16 @@
 | **Neosync** | Heavy Docker setup, fails on circular foreign keys |
 | **pg_dump** | Full database only — no subsetting |
 
-**dbdrain** fills this void: a single Go binary, no runtime dependencies, no YAML, no Docker.
+**dbdrain** fills this void: a single Go binary, no runtime dependencies, no Docker, no YAML for basic usage.
 
-- 🔗 **Referentially intact subsets** — recursively follows every FK chain upward and downward from your seed rows
+- 🔗 **Referentially intact subsets** — recursively follows every FK chain upward and downward from seed rows
 - 🔄 **Circular FK handling** — Tarjan's SCC detects cycles and emits `SET CONSTRAINTS ALL DEFERRED` automatically
 - 🌿 **Self-referencing hierarchies** — `users.manager_id → users.id`, `categories.parent_id → categories.id` resolved via recursive CTEs
-- 🎭 **Deterministic PII masking** — HMAC-SHA256 — same input always produces the same masked output (no UNIQUE violations)
+- 🧩 **Polymorphic associations** — virtual FKs for Rails-style `commentable_id` / `commentable_type` patterns
+- 🎭 **Deterministic PII masking** — HMAC-SHA256 ensures the same input always produces the same output (no UNIQUE violations)
+- 📋 **Declarative config** — `dbdrain.yaml` for custom masking rules and virtual FK declarations
 - 🚀 **Direct target streaming** — bypass file I/O and hydrate a staging DB in one command
+- ✅ **Integrity verification** — post-hydration orphan detection with `--verify`
 - 🛡️ **Explosion safeguards** — `--depth` and `--max-rows-per-table` prevent pulling entire production datasets
 
 ---
@@ -82,7 +85,7 @@ dbdrain \
   | psql postgres://user:pass@staging-host/stagingdb
 ```
 
-### 3. Direct streaming hydration (--target)
+### 3. Direct streaming hydration with integrity check
 
 ```bash
 dbdrain \
@@ -91,19 +94,19 @@ dbdrain \
   --target "postgres://user:pass@localhost/staging" \
   --anonymize-pii \
   --depth 2 \
-  --max-rows-per-table 500
+  --max-rows-per-table 500 \
+  --verify
 ```
 
-### 4. Limit traversal depth and row explosion
+### 4. Declarative config with polymorphic FKs
 
 ```bash
-# Only pull 2 levels of children, cap each table at 1000 rows
 dbdrain \
   --source "postgres://user:pass@prod/mydb" \
-  --from "tenants WHERE id = 42" \
-  --depth 2 \
-  --max-rows-per-table 1000 \
-  --output tenant_42.sql
+  --from "posts WHERE id = 42" \
+  --config dbdrain.yaml \
+  --target "postgres://user:pass@localhost/staging" \
+  --verify
 ```
 
 ---
@@ -118,27 +121,127 @@ dbdrain \
 | `--schema` | string | `public` | PostgreSQL schema to operate on |
 | `--anonymize-pii` | bool | `false` | Enable deterministic PII masking |
 | `--salt` | string | `dbdrain-secret-salt` | HMAC salt for reproducible masking |
-| `--depth` | int | `0` (unlimited) | Max downward FK traversal depth (parent traversal always unlimited) |
+| `--depth` | int | `0` (unlimited) | Max downward FK traversal depth (parents always unlimited) |
 | `--max-rows-per-table` | int | `0` (unlimited) | Hard ceiling on rows pulled per child table |
-| `--target` | string | — | Target DB connection string for direct streaming hydration |
+| `--target` | string | — | Target DB for direct streaming hydration (bypasses `--output`) |
+| `--config` | string | `dbdrain.yaml` (auto) | Path to declarative config file |
+| `--verify` | bool | `false` | Run post-hydration orphan integrity checks (requires `--target`) |
 
 ---
 
-## PII Masking Rules
+## `dbdrain.yaml` — Declarative Config
 
-When `--anonymize-pii` is enabled, columns are masked deterministically using **HMAC-SHA256** keyed by `--salt`:
+Place a `dbdrain.yaml` in your working directory (or point to it with `--config`):
 
-| Column name pattern | Masked format |
-|---------------------|---------------|
+```yaml
+rules:
+  # Exact table + column
+  - table: users
+    column: email
+    transform: fake_email       # anon_<hmac>@drain.local
+
+  - table: users
+    column: password
+    transform: redact           # [REDACTED]
+
+  # Wildcard table, glob column pattern — catches access_token, refresh_token, etc.
+  - table: "*"
+    column: "*_token"
+    transform: uuid_remap       # deterministic UUID v4 from HMAC
+
+  # Exact table, wildcard column
+  - table: audit_logs
+    column: "*"
+    transform: redact
+
+virtual_foreign_keys:
+  # Rails-style polymorphic association:
+  # comments.commentable_id → posts.id (when commentable_type = 'post')
+  # comments.commentable_id → videos.id (when commentable_type = 'video')
+  - child_table: comments
+    child_column: commentable_id
+    parent_table_column: commentable_type   # runtime discriminator column
+    mappings:
+      post: posts.id
+      video: videos.id
+
+  # Another polymorphic example
+  - child_table: attachments
+    child_column: attachable_id
+    parent_table_column: attachable_type
+    mappings:
+      post: posts.id
+      user: users.id
+```
+
+### Available Transforms
+
+| Transform | Output format |
+|-----------|--------------|
+| `fake_email` | `anon_<hmac[:10]>@drain.local` |
+| `redact` | `[REDACTED]` |
+| `uuid_remap` | Deterministic RFC 4122 UUID v4 |
+| `hmac_phone` | `+1555<hmac[:7]>` |
+| `hmac_name` | `User_<hmac[:6]>` |
+| `hmac_token` | `tok_<hmac[:16]>` |
+| `redact_password` | `$2a$12$e8rG.e9y1dYv9fD1v1.X7fakehash` |
+
+> [!NOTE]
+> If no config rule matches a column, dbdrain falls back to automatic PII heuristics based on column name patterns (`email`, `*_token`, `password`, etc.).
+
+### Wildcard Matching Rules
+
+| Pattern | Matches |
+|---------|---------|
+| `*` | Everything |
+| `*_token` | `access_token`, `refresh_token`, `api_token` |
+| `user_*` | `user_id`, `user_email`, `user_name` |
+| `*email*` | `email`, `user_email`, `email_address` |
+| `exact` | Only `exact` |
+
+**Priority** (highest wins): exact table + exact column > exact table + glob column > glob table + exact column > all wildcards.
+
+---
+
+## Automatic PII Masking Rules
+
+When `--anonymize-pii` is enabled and no config rule matches, columns are auto-masked by name heuristic:
+
+| Column name pattern | Auto-masked format |
+|---------------------|--------------------|
 | `email`, `*_email` | `anon_<hash[:10]>@drain.local` |
 | `phone`, `mobile`, `*phone*` | `+1555<hash[:7]>` |
-| `first_name`, `name`, `*_name` | `User_<hash[:6]>` |
+| `first_name` | `User_<hash[:6]>` |
 | `last_name` | `Anon_<hash[:6]>` |
+| `name`, `*_name` | `User_<hash[:6]>` |
 | `password`, `passwd` | `$2a$12$e8rG.e9y1dYv9fD1v1.X7fakehash` |
 | `token`, `secret`, `*token*` | `tok_<hash[:16]>` |
 
-> [!NOTE]
-> The same input value + salt always produces the same masked output, so foreign key references across tables remain consistent and UNIQUE constraints are never violated.
+---
+
+## Post-Hydration Integrity Verification (`--verify`)
+
+When `--verify` is combined with `--target`, dbdrain runs orphan-check queries on the target database after loading:
+
+```sql
+-- Generated per FK relationship:
+SELECT COUNT(*)
+FROM public.comments c
+LEFT JOIN public.posts p ON p.id = c.post_id
+WHERE c.post_id IS NOT NULL AND p.id IS NULL;
+```
+
+**TTY output (success):**
+```
+  ✔  Integrity verified: 0 orphaned foreign keys across all drained tables.
+```
+
+**TTY output (failure — exits with code 1):**
+```
+  ✘  2 FK violation(s) detected:
+     • comments.post_id → posts.id : 3 orphaned row(s)
+     • likes.user_id → users.id : 1 orphaned row(s)
+```
 
 ---
 
@@ -147,44 +250,63 @@ When `--anonymize-pii` is enabled, columns are masked deterministically using **
 ```
 dbdrain --from "users WHERE id=1"
     │
-    ├─ introspect/postgres.go
+    ├─ internal/config/config.go
+    │    └─ Loads dbdrain.yaml: masking rules, virtual FK declarations
+    │       Priority-based wildcard FindRule (exact > glob)
+    │
+    ├─ internal/introspect/postgres.go
     │    └─ Queries information_schema + pg_constraint
     │       Discovers columns, PKs, composite FKs, deferrability
     │
-    ├─ graph/graph.go
-    │    └─ Builds directed adjacency-list FK graph
+    ├─ internal/graph/graph.go
+    │    ├─ Builds directed adjacency-list FK graph
+    │    └─ Registers virtual FK edges from config
     │
-    ├─ graph/tarjan.go
+    ├─ internal/graph/tarjan.go
     │    └─ Tarjan's SCC → detects circular FK dependencies
     │       Emits SET CONSTRAINTS ALL DEFERRED when cycles found
     │
-    ├─ drain/export.go
+    ├─ internal/drain/export.go
     │    ├─ REPEATABLE READ snapshot transaction on source
     │    ├─ Self-ref tables → recursive CTE (WITH RECURSIVE hierarchy AS ...)
     │    ├─ Upward BFS: mandatory parent traversal (unlimited depth)
     │    ├─ Downward BFS: child traversal (bounded by --depth, --max-rows-per-table)
+    │    ├─ Polymorphic BFS: virtual FK parent resolution via discriminator column
     │    ├─ Visited-set deduplication prevents infinite loops
+    │    ├─ Config-rule masking (priority) → auto-heuristic fallback
     │    └─ Mode A: emit SQL text  |  Mode B: stream to --target via pgx batched inserts
     │
-    ├─ anonymize/mask.go
-    │    └─ HMAC-SHA256 deterministic masking by column name heuristics
+    ├─ internal/anonymize/mask.go
+    │    └─ HMAC-SHA256 masking: fake_email, redact, uuid_remap, hmac_phone, hmac_name, hmac_token
     │
-    └─ ui/progress.go
+    ├─ internal/verify/verify.go
+    │    └─ LEFT JOIN orphan queries on target DB; exits 1 on violations
+    │
+    └─ internal/ui/progress.go
          ├─ TTY detected → animated Lipgloss spinner + summary table (stderr)
-         └─ Non-TTY / pipe → pure SQL only, no ANSI codes
+         ├─ Non-TTY / pipe → pure SQL only, no ANSI codes
+         └─ Integrity section: ✔ pass / ✘ violation list
 ```
 
-### Circular FK Resolution
+### Polymorphic Virtual FK Resolution
+
+```yaml
+# dbdrain.yaml
+virtual_foreign_keys:
+  - child_table: comments
+    child_column: commentable_id
+    parent_table_column: commentable_type
+    mappings:
+      post: posts.id
+      video: videos.id
+```
+
+During BFS, when rows are fetched from `comments`, dbdrain captures each `(commentable_type, commentable_id)` pair. It then groups by discriminator value and fetches the corresponding parent rows:
 
 ```
-          orders ──────────────────► users
-            │                          ▲
-            └──► order_items           │
-                      │                │
-                      └──► products ───┘
-                                │
-                          (cycle detected by Tarjan SCC)
-                          → SET CONSTRAINTS ALL DEFERRED;
+comments rows:
+  {commentable_type: "post",  commentable_id: 5}  → fetch posts WHERE id IN ('5')
+  {commentable_type: "video", commentable_id: 9}  → fetch videos WHERE id IN ('9')
 ```
 
 ### Self-Referencing Hierarchy
@@ -208,18 +330,33 @@ SELECT DISTINCT * FROM hierarchy;
 ## Development
 
 ```bash
-# Run all tests
+# Run all tests (62 tests across 6 packages)
 go test ./...
 
-# Build for all platforms
-make build-all   # or see dist/ build commands below
-
-# Cross-compile
+# Cross-compile release binaries
 GOOS=linux   GOARCH=amd64  CGO_ENABLED=0 go build -o dist/dbdrain-linux-amd64   ./cmd/dbdrain/
 GOOS=darwin  GOARCH=arm64  CGO_ENABLED=0 go build -o dist/dbdrain-darwin-arm64  ./cmd/dbdrain/
 GOOS=darwin  GOARCH=amd64  CGO_ENABLED=0 go build -o dist/dbdrain-darwin-amd64  ./cmd/dbdrain/
 GOOS=windows GOARCH=amd64  CGO_ENABLED=0 go build -o dist/dbdrain-windows-amd64.exe ./cmd/dbdrain/
 ```
+
+---
+
+## Changelog
+
+### v0.3.0
+- ✨ Declarative `dbdrain.yaml` config: custom masking rules, wildcard/glob matching, transform pipeline
+- 🧩 Polymorphic virtual FK support: resolve Rails-style `commentable_id`/`commentable_type` associations
+- ✅ `--verify`: post-hydration orphan integrity checker with Lipgloss UI and exit code 1 on violations
+- 🔧 New masking transforms: `redact`, `uuid_remap` (RFC 4122 v4), `hmac_phone`, `hmac_name`, `hmac_token`
+
+### v0.2.0
+- `--depth` and `--max-rows-per-table` explosion safeguards
+- `--target` direct DB streaming hydration
+- Self-referencing hierarchy recursive CTE resolution
+
+### v0.1.0
+- Initial release: anchor seed, FK closure, Tarjan SCC, deterministic HMAC masking, TTY spinner
 
 ---
 

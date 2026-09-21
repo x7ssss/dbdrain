@@ -13,11 +13,15 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/spf13/cobra"
+	"github.com/x7ssss/dbdrain/internal/config"
 	"github.com/x7ssss/dbdrain/internal/drain"
 	"github.com/x7ssss/dbdrain/internal/graph"
 	"github.com/x7ssss/dbdrain/internal/introspect"
 	"github.com/x7ssss/dbdrain/internal/ui"
+	"github.com/x7ssss/dbdrain/internal/verify"
 )
+
+const version = "v0.3.0"
 
 var (
 	source          string
@@ -29,29 +33,32 @@ var (
 	maxRowsPerTable int
 	maxDepth        int
 	target          string
+	configPath      string
+	doVerify        bool
 )
 
 var rootCmd = &cobra.Command{
 	Use:   "dbdrain",
 	Short: "High-performance PostgreSQL database slicer and PII anonymizer",
-	Long: `dbdrain extracts referentially intact subsets from a production PostgreSQL
-database, resolves circular FK dependencies, and deterministically masks PII.
+	Long: `dbdrain ` + version + ` extracts referentially intact subsets from a production
+PostgreSQL database, resolves circular FK dependencies, handles polymorphic
+associations, and deterministically masks PII.
 
 Examples:
   # Stream slice to stdout and pipe directly into psql
   dbdrain --source "postgres://user:pass@localhost/prod" \
           --from "users WHERE id IN (1,2,3) LIMIT 50" | psql postgres://localhost/staging
 
-  # Save to file with PII masking
+  # Save to file with PII masking and declarative config rules
   dbdrain --source "postgres://user:pass@localhost/prod" \
           --from "orders WHERE created_at > NOW() - INTERVAL '7 days' LIMIT 100" \
-          --anonymize-pii --output slice.sql
+          --anonymize-pii --config dbdrain.yaml --output slice.sql
 
-  # Stream directly into a target database
+  # Stream directly into a target database with integrity check
   dbdrain --source "postgres://user:pass@localhost/prod" \
           --from "users WHERE id = 42 LIMIT 1" \
           --target "postgres://user:pass@localhost/staging" \
-          --depth 2 --max-rows-per-table 500`,
+          --depth 2 --max-rows-per-table 500 --verify`,
 	RunE: runDrain,
 }
 
@@ -65,6 +72,8 @@ func init() {
 	rootCmd.Flags().IntVar(&maxRowsPerTable, "max-rows-per-table", 0, "Hard cap on rows pulled per child table (0 = unlimited)")
 	rootCmd.Flags().IntVar(&maxDepth, "depth", 0, "Max FK traversal depth for child tables (0 = unlimited; parents always fully resolved)")
 	rootCmd.Flags().StringVar(&target, "target", "", "Target PostgreSQL connection string for direct hydration (bypasses --output)")
+	rootCmd.Flags().StringVar(&configPath, "config", "", "Path to dbdrain.yaml config file (auto-detected if omitted)")
+	rootCmd.Flags().BoolVar(&doVerify, "verify", false, "Run post-hydration orphan integrity checks on --target (requires --target)")
 
 	rootCmd.MarkFlagRequired("source")
 	rootCmd.MarkFlagRequired("from")
@@ -81,7 +90,6 @@ func main() {
 func parseFromExpr(expr string) (table string, whereClause string, limit int, err error) {
 	expr = strings.TrimSpace(expr)
 
-	// Extract LIMIT
 	limitRe := regexp.MustCompile(`(?i)\sLIMIT\s+(\d+)\s*$`)
 	if m := limitRe.FindStringSubmatchIndex(expr); m != nil {
 		limitStr := expr[m[2]:m[3]]
@@ -92,7 +100,6 @@ func parseFromExpr(expr string) (table string, whereClause string, limit int, er
 		expr = strings.TrimSpace(expr[:m[0]])
 	}
 
-	// Extract WHERE
 	whereRe := regexp.MustCompile(`(?i)^(\S+)\s+WHERE\s+(.+)$`)
 	if m := whereRe.FindStringSubmatch(expr); m != nil {
 		table = m[1]
@@ -100,7 +107,6 @@ func parseFromExpr(expr string) (table string, whereClause string, limit int, er
 		return
 	}
 
-	// Just a table name
 	parts := strings.Fields(expr)
 	if len(parts) == 0 {
 		err = fmt.Errorf("--from expression is empty")
@@ -114,14 +120,23 @@ func runDrain(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 	start := time.Now()
 
-	// Parse --from expression
+	// Validate flags.
+	if doVerify && target == "" {
+		return fmt.Errorf("--verify requires --target to be set")
+	}
+
 	anchorTable, anchorWhere, anchorLimit, err := parseFromExpr(fromExpr)
 	if err != nil {
 		return fmt.Errorf("invalid --from expression: %w", err)
 	}
 
-	isTTY := ui.IsTTY()
+	// Load declarative config (silently skips if no dbdrain.yaml found).
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
 
+	isTTY := ui.IsTTY()
 	var spinner *ui.Spinner
 	spinnerMsg := func(msg string) {
 		if spinner != nil {
@@ -141,7 +156,6 @@ func runDrain(cmd *cobra.Command, args []string) error {
 
 	spinnerMsg("Connecting to source database...")
 
-	// Connect to source
 	conn, err := pgx.Connect(ctx, source)
 	if err != nil {
 		stopSpinner()
@@ -151,26 +165,38 @@ func runDrain(cmd *cobra.Command, args []string) error {
 
 	spinnerMsg("Introspecting schema...")
 
-	// Introspect schema
 	schema, err := introspect.Load(ctx, conn, schemaName)
 	if err != nil {
 		stopSpinner()
 		return fmt.Errorf("introspect schema: %w", err)
 	}
 
-	// Build dependency graph + detect cycles
-	g := graph.New(schema)
+	// Convert config virtual FKs → graph.VirtualFKInput.
+	var vfkInputs []graph.VirtualFKInput
+	for _, vfk := range cfg.VirtualForeignKeys {
+		vfkInputs = append(vfkInputs, graph.VirtualFKInput{
+			ChildTable:       vfk.ChildTable,
+			ChildColumn:      vfk.ChildColumn,
+			DiscriminatorCol: vfk.ParentTableColumn,
+			Mappings:         vfk.Mappings,
+		})
+	}
+
+	g := graph.New(schema, vfkInputs)
 	sccs := graph.TarjanSCC(g)
 
-	exporter := drain.New(conn, schema, g, sccs, drain.Config{
+	drainCfg := drain.Config{
 		Schema:          schemaName,
 		AnonymizePII:    anonymize,
 		Salt:            salt,
 		MaxRowsPerTable: maxRowsPerTable,
 		MaxDepth:        maxDepth,
-	})
+		Rules:           cfg.Rules,
+	}
 
-	// --- Direct target hydration mode ---
+	exporter := drain.New(conn, schema, g, sccs, drainCfg)
+
+	// ---- Direct target hydration mode ----
 	if target != "" {
 		spinnerMsg("Connecting to target database...")
 		targetConn, err := pgx.Connect(ctx, target)
@@ -185,17 +211,15 @@ func runDrain(cmd *cobra.Command, args []string) error {
 
 		spinnerMsg(fmt.Sprintf("Streaming '%s' → target...", anchorTable))
 
-		progressFn := func(table string, n int) {
+		progressFn := func(tbl string, n int) {
 			mu.Lock()
-			rowsStreamed[table] += n
+			rowsStreamed[tbl] += n
+			total := 0
+			for _, v := range rowsStreamed {
+				total += v
+			}
 			mu.Unlock()
-			if isTTY {
-				mu.Lock()
-				total := 0
-				for _, v := range rowsStreamed {
-					total += v
-				}
-				mu.Unlock()
+			if isTTY && spinner != nil {
 				spinner.UpdateMessage(fmt.Sprintf("Streaming '%s' → target (%d rows)...", anchorTable, total))
 			}
 		}
@@ -203,6 +227,26 @@ func runDrain(cmd *cobra.Command, args []string) error {
 		if err := exporter.ExportToTarget(ctx, targetConn, anchorTable, anchorWhere, anchorLimit, progressFn); err != nil {
 			stopSpinner()
 			return fmt.Errorf("stream to target: %w", err)
+		}
+
+		// Post-hydration integrity verification.
+		var uiViolations []ui.Violation
+		if doVerify {
+			spinnerMsg("Running integrity checks...")
+			violations, verifyErr := verify.Run(ctx, targetConn, schemaName, schema, exporter.RowCounts)
+			if verifyErr != nil {
+				stopSpinner()
+				return fmt.Errorf("integrity check: %w", verifyErr)
+			}
+			for _, v := range violations {
+				uiViolations = append(uiViolations, ui.Violation{
+					ChildTable:   v.ChildTable,
+					ChildColumn:  v.ChildColumn,
+					ParentTable:  v.ParentTable,
+					ParentColumn: v.ParentColumn,
+					OrphanCount:  v.OrphanCount,
+				})
+			}
 		}
 
 		stopSpinner()
@@ -216,17 +260,28 @@ func runDrain(cmd *cobra.Command, args []string) error {
 				}
 			}
 			sum := &ui.Summary{
-				Rows:      exporter.RowCounts,
-				Duration:  time.Since(start),
-				HasCycles: hasCycles,
-				Target:    target,
+				Rows:       exporter.RowCounts,
+				Duration:   time.Since(start),
+				HasCycles:  hasCycles,
+				Target:     target,
+				Violations: uiViolations,
+				VerifyRan:  doVerify,
 			}
 			sum.Print(os.Stderr)
+		} else if doVerify && len(uiViolations) > 0 {
+			for _, v := range uiViolations {
+				fmt.Fprintf(os.Stderr, "ORPHAN: %s.%s → %s.%s : %d rows\n",
+					v.ChildTable, v.ChildColumn, v.ParentTable, v.ParentColumn, v.OrphanCount)
+			}
+		}
+
+		if len(uiViolations) > 0 {
+			os.Exit(1)
 		}
 		return nil
 	}
 
-	// --- SQL emission mode ---
+	// ---- SQL emission mode ----
 	var w io.Writer = os.Stdout
 	if output != "" && output != "-" {
 		f, err := os.Create(output)
@@ -247,7 +302,6 @@ func runDrain(cmd *cobra.Command, args []string) error {
 
 	stopSpinner()
 
-	// Print summary on TTY
 	if isTTY {
 		hasCycles := false
 		for _, scc := range sccs {

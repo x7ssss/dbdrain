@@ -80,6 +80,20 @@ type Summary struct {
 	HasCycles bool
 	// Target is the target DB connection string (non-empty when using --target).
 	Target string
+	// VerifyRan is true when --verify was set.
+	VerifyRan bool
+	// Violations holds integrity check results (nil or empty = all clean).
+	Violations []verifyViolation
+}
+
+// verifyViolation is a local alias so ui/ does not import verify/ (avoids cycle).
+// Populated by the caller (main.go) by copying verify.Violation fields.
+type verifyViolation struct {
+	ChildTable   string
+	ChildColumn  string
+	ParentTable  string
+	ParentColumn string
+	OrphanCount  int64
 }
 
 // Print renders the summary table to w.
@@ -101,15 +115,13 @@ func (sum *Summary) Print(w io.Writer) {
 	}
 
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, headerStyle.Render("  dbdrain v0.2.0  — slice complete ("+modeLabel+")"))
+	fmt.Fprintln(w, headerStyle.Render("  dbdrain v0.3.0  — slice complete ("+modeLabel+")"))
 	fmt.Fprintln(w)
 
-	// Sort tables for deterministic output.
 	tables := make([]string, 0, len(sum.Rows))
 	for t := range sum.Rows {
 		tables = append(tables, t)
 	}
-	// Simple insertion sort for readability (small N).
 	for i := 1; i < len(tables); i++ {
 		for j := i; j > 0 && tables[j] < tables[j-1]; j-- {
 			tables[j], tables[j-1] = tables[j-1], tables[j]
@@ -133,5 +145,24 @@ func (sum *Summary) Print(w io.Writer) {
 		warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#F59E0B")).Bold(true)
 		fmt.Fprintf(w, "  %s\n", warnStyle.Render("⚠  Circular FK dependencies detected — SET CONSTRAINTS ALL DEFERRED used"))
 	}
+
+	if sum.VerifyRan {
+		fmt.Fprintln(w)
+		if len(sum.Violations) == 0 {
+			okStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#10B981")).Bold(true)
+			fmt.Fprintf(w, "  %s\n", okStyle.Render("✔  Integrity verified: 0 orphaned foreign keys across all drained tables."))
+		} else {
+			errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#EF4444")).Bold(true)
+			fmt.Fprintf(w, "  %s\n", errStyle.Render(fmt.Sprintf("✘  %d FK violation(s) detected:", len(sum.Violations))))
+			for _, v := range sum.Violations {
+				fmt.Fprintf(w, "     • %s.%s → %s.%s : %d orphaned row(s)\n",
+					v.ChildTable, v.ChildColumn, v.ParentTable, v.ParentColumn, v.OrphanCount)
+			}
+		}
+	}
+
 	fmt.Fprintln(w)
 }
+
+// Violation is exported so main.go can populate Summary.Violations without importing verify/.
+type Violation = verifyViolation
