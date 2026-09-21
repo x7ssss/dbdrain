@@ -1,0 +1,16 @@
+# dbdrain binaries
+dist/
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Environment
+.env
+.env.local

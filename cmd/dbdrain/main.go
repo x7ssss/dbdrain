@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -19,12 +20,15 @@ import (
 )
 
 var (
-	source      string
-	fromExpr    string
-	output      string
-	schemaName  string
-	anonymize   bool
-	salt        string
+	source          string
+	fromExpr        string
+	output          string
+	schemaName      string
+	anonymize       bool
+	salt            string
+	maxRowsPerTable int
+	maxDepth        int
+	target          string
 )
 
 var rootCmd = &cobra.Command{
@@ -33,10 +37,21 @@ var rootCmd = &cobra.Command{
 	Long: `dbdrain extracts referentially intact subsets from a production PostgreSQL
 database, resolves circular FK dependencies, and deterministically masks PII.
 
-Example:
+Examples:
+  # Stream slice to stdout and pipe directly into psql
   dbdrain --source "postgres://user:pass@localhost/prod" \
-          --from "users WHERE id IN (1,2,3) LIMIT 50" \
-          --anonymize-pii --output slice.sql`,
+          --from "users WHERE id IN (1,2,3) LIMIT 50" | psql postgres://localhost/staging
+
+  # Save to file with PII masking
+  dbdrain --source "postgres://user:pass@localhost/prod" \
+          --from "orders WHERE created_at > NOW() - INTERVAL '7 days' LIMIT 100" \
+          --anonymize-pii --output slice.sql
+
+  # Stream directly into a target database
+  dbdrain --source "postgres://user:pass@localhost/prod" \
+          --from "users WHERE id = 42 LIMIT 1" \
+          --target "postgres://user:pass@localhost/staging" \
+          --depth 2 --max-rows-per-table 500`,
 	RunE: runDrain,
 }
 
@@ -47,6 +62,9 @@ func init() {
 	rootCmd.Flags().StringVar(&schemaName, "schema", "public", "Target schema name")
 	rootCmd.Flags().BoolVar(&anonymize, "anonymize-pii", false, "Enable deterministic PII masking")
 	rootCmd.Flags().StringVar(&salt, "salt", "dbdrain-secret-salt", "Salt for deterministic HMAC masking")
+	rootCmd.Flags().IntVar(&maxRowsPerTable, "max-rows-per-table", 0, "Hard cap on rows pulled per child table (0 = unlimited)")
+	rootCmd.Flags().IntVar(&maxDepth, "depth", 0, "Max FK traversal depth for child tables (0 = unlimited; parents always fully resolved)")
+	rootCmd.Flags().StringVar(&target, "target", "", "Target PostgreSQL connection string for direct hydration (bypasses --output)")
 
 	rootCmd.MarkFlagRequired("source")
 	rootCmd.MarkFlagRequired("from")
@@ -61,7 +79,6 @@ func main() {
 // parseFromExpr parses the --from expression into table, where clause, and limit.
 // Format: "<table> [WHERE <clause>] [LIMIT <n>]"
 func parseFromExpr(expr string) (table string, whereClause string, limit int, err error) {
-	// Normalize whitespace
 	expr = strings.TrimSpace(expr)
 
 	// Extract LIMIT
@@ -103,77 +120,132 @@ func runDrain(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid --from expression: %w", err)
 	}
 
-	// Determine output writer
+	isTTY := ui.IsTTY()
+
+	var spinner *ui.Spinner
+	spinnerMsg := func(msg string) {
+		if spinner != nil {
+			spinner.Stop()
+		}
+		if isTTY {
+			spinner = ui.NewSpinner(msg)
+			spinner.Start()
+		}
+	}
+	stopSpinner := func() {
+		if spinner != nil {
+			spinner.Stop()
+			spinner = nil
+		}
+	}
+
+	spinnerMsg("Connecting to source database...")
+
+	// Connect to source
+	conn, err := pgx.Connect(ctx, source)
+	if err != nil {
+		stopSpinner()
+		return fmt.Errorf("connect to source: %w", err)
+	}
+	defer conn.Close(ctx)
+
+	spinnerMsg("Introspecting schema...")
+
+	// Introspect schema
+	schema, err := introspect.Load(ctx, conn, schemaName)
+	if err != nil {
+		stopSpinner()
+		return fmt.Errorf("introspect schema: %w", err)
+	}
+
+	// Build dependency graph + detect cycles
+	g := graph.New(schema)
+	sccs := graph.TarjanSCC(g)
+
+	exporter := drain.New(conn, schema, g, sccs, drain.Config{
+		Schema:          schemaName,
+		AnonymizePII:    anonymize,
+		Salt:            salt,
+		MaxRowsPerTable: maxRowsPerTable,
+		MaxDepth:        maxDepth,
+	})
+
+	// --- Direct target hydration mode ---
+	if target != "" {
+		spinnerMsg("Connecting to target database...")
+		targetConn, err := pgx.Connect(ctx, target)
+		if err != nil {
+			stopSpinner()
+			return fmt.Errorf("connect to target: %w", err)
+		}
+		defer targetConn.Close(ctx)
+
+		var mu sync.Mutex
+		rowsStreamed := make(map[string]int)
+
+		spinnerMsg(fmt.Sprintf("Streaming '%s' → target...", anchorTable))
+
+		progressFn := func(table string, n int) {
+			mu.Lock()
+			rowsStreamed[table] += n
+			mu.Unlock()
+			if isTTY {
+				mu.Lock()
+				total := 0
+				for _, v := range rowsStreamed {
+					total += v
+				}
+				mu.Unlock()
+				spinner.UpdateMessage(fmt.Sprintf("Streaming '%s' → target (%d rows)...", anchorTable, total))
+			}
+		}
+
+		if err := exporter.ExportToTarget(ctx, targetConn, anchorTable, anchorWhere, anchorLimit, progressFn); err != nil {
+			stopSpinner()
+			return fmt.Errorf("stream to target: %w", err)
+		}
+
+		stopSpinner()
+
+		if isTTY {
+			hasCycles := false
+			for _, scc := range sccs {
+				if scc.HasCycle {
+					hasCycles = true
+					break
+				}
+			}
+			sum := &ui.Summary{
+				Rows:      exporter.RowCounts,
+				Duration:  time.Since(start),
+				HasCycles: hasCycles,
+				Target:    target,
+			}
+			sum.Print(os.Stderr)
+		}
+		return nil
+	}
+
+	// --- SQL emission mode ---
 	var w io.Writer = os.Stdout
 	if output != "" && output != "-" {
 		f, err := os.Create(output)
 		if err != nil {
+			stopSpinner()
 			return fmt.Errorf("open output file: %w", err)
 		}
 		defer f.Close()
 		w = f
 	}
 
-	isTTY := ui.IsTTY()
-
-	var spinner *ui.Spinner
-	if isTTY {
-		spinner = ui.NewSpinner("Connecting to database...")
-		spinner.Start()
-	}
-
-	// Connect to PostgreSQL
-	conn, err := pgx.Connect(ctx, source)
-	if err != nil {
-		if spinner != nil {
-			spinner.Stop()
-		}
-		return fmt.Errorf("connect to database: %w", err)
-	}
-	defer conn.Close(ctx)
-
-	if spinner != nil {
-		spinner.Stop()
-		spinner = ui.NewSpinner("Introspecting schema...")
-		spinner.Start()
-	}
-
-	// Introspect schema
-	schema, err := introspect.Load(ctx, conn, schemaName)
-	if err != nil {
-		if spinner != nil {
-			spinner.Stop()
-		}
-		return fmt.Errorf("introspect schema: %w", err)
-	}
-
-	// Build dependency graph
-	g := graph.New(schema)
-	sccs := graph.TarjanSCC(g)
-
-	if spinner != nil {
-		spinner.Stop()
-		spinner = ui.NewSpinner(fmt.Sprintf("Exporting slice from '%s'...", anchorTable))
-		spinner.Start()
-	}
-
-	// Export
-	exporter := drain.New(conn, schema, g, sccs, drain.Config{
-		Schema:       schemaName,
-		AnonymizePII: anonymize,
-		Salt:         salt,
-	})
+	spinnerMsg(fmt.Sprintf("Exporting slice from '%s'...", anchorTable))
 
 	if err := exporter.Export(ctx, w, anchorTable, anchorWhere, anchorLimit); err != nil {
-		if spinner != nil {
-			spinner.Stop()
-		}
+		stopSpinner()
 		return fmt.Errorf("export: %w", err)
 	}
 
-	if spinner != nil {
-		spinner.Stop()
-	}
+	stopSpinner()
 
 	// Print summary on TTY
 	if isTTY {
@@ -185,7 +257,7 @@ func runDrain(cmd *cobra.Command, args []string) error {
 			}
 		}
 		sum := &ui.Summary{
-			Rows:      make(map[string]int),
+			Rows:      exporter.RowCounts,
 			Duration:  time.Since(start),
 			HasCycles: hasCycles,
 		}
