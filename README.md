@@ -5,6 +5,7 @@
 **Zero-downtime PostgreSQL database subsetting, polymorphic FK resolution & deterministic PII masking — in a single static binary.**
 
 [![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)](https://go.dev)
+[![npm](https://img.shields.io/npm/v/dbdrain?logo=npm&color=CB3837)](https://www.npmjs.com/package/dbdrain)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/x7ssss/dbdrain)](https://github.com/x7ssss/dbdrain/releases)
 [![Go Report Card](https://goreportcard.com/badge/github.com/x7ssss/dbdrain)](https://goreportcard.com/report/github.com/x7ssss/dbdrain)
@@ -24,6 +25,9 @@
 
 **dbdrain** fills this void: a single Go binary, no runtime dependencies, no Docker, no YAML for basic usage.
 
+- ⚡ **Zero-Copy Streaming Engine** — direct `pgx.CopyFromSource` over live cursors with `sync.Pool` buffer recycling for flat O(1) memory usage during millions of rows extractions
+- 🧠 **Smart Query Batching** — `= ANY($1::type[])` parameterized binding avoids GEQO degradation up to 10k keys; automatically promotes to `UNLOGGED` scratch tables + binary `COPY` + indexed `JOIN` for >10k keys
+- 📦 **Zero-Config npm Distribution** — run instantly with `npx dbdrain` via platform-native `optionalDependencies` binaries
 - 🔗 **Referentially intact subsets** — recursively follows every FK chain upward and downward from seed rows
 - 🔄 **Circular FK handling** — Tarjan's SCC detects cycles and emits `SET CONSTRAINTS ALL DEFERRED` automatically
 - 🌿 **Self-referencing hierarchies** — `users.manager_id → users.id`, `categories.parent_id → categories.id` resolved via recursive CTEs
@@ -38,7 +42,24 @@
 
 ## Quick Start
 
-### Download
+### Run with npx (Node.js)
+
+No manual binary installation required:
+
+```bash
+npx dbdrain --source "postgres://user:pass@prod-host/mydb" \
+            --from "users WHERE id IN (1, 2, 3) LIMIT 50" \
+            --anonymize-pii \
+            --output slice.sql
+```
+
+Or install globally via npm:
+
+```bash
+npm install -g dbdrain
+```
+
+### Download Standalone Binary
 
 ```bash
 # Linux (amd64)
@@ -87,6 +108,8 @@ dbdrain \
 
 ### 3. Direct streaming hydration with integrity check
 
+Streams directly from source PostgreSQL into target PostgreSQL with **zero disk writes** and **flat O(1) memory consumption**:
+
 ```bash
 dbdrain \
   --source "postgres://user:pass@prod-host/mydb" \
@@ -126,6 +149,53 @@ dbdrain \
 | `--target` | string | — | Target DB for direct streaming hydration (bypasses `--output`) |
 | `--config` | string | `dbdrain.yaml` (auto) | Path to declarative config file |
 | `--verify` | bool | `false` | Run post-hydration orphan integrity checks (requires `--target`) |
+
+---
+
+## Streaming Engine & Query Planner (v0.4.0)
+
+### 1. Zero-Copy `pgx.CopyFromSource` Architecture
+
+When `--target` is specified, `dbdrain` does not buffer records into memory (`[]Row` or `[][]any`). Instead, it wires a custom `CursorCopySource` directly between the source cursor and the target PostgreSQL binary COPY stream:
+
+```
+Source Postgres (Snapshot Tx)
+      │
+      ▼  (wire protocol rows)
+pgx.Rows Cursor
+      │
+      ▼  (row-by-row)
+CursorCopySource (implements pgx.CopyFromSource)
+      ├── sync.Pool buffer recycling (0 allocations per row)
+      ├── In-place HMAC deterministic PII masking
+      └── Real-time progress metric callbacks
+      │
+      ▼  (binary COPY stream)
+Target Postgres (targetTx.CopyFrom with DEFERRED constraints)
+```
+
+- **O(1) Heap Memory**: Regardless of whether you extract 10 rows or 10,000,000 rows, memory consumption remains flat.
+- **Pooled Buffers**: Slice buffers are recycled through `sync.Pool` and zeroed out for GC safety.
+
+### 2. Parameterized Array Query Batching (`= ANY($1)`)
+
+When resolving parent and child relationships across tables, dbdrain avoids naive `WHERE col IN (...)` query generation:
+
+- **1 to 10,000 keys**: Queries are compiled into parameterized array lookups:
+  ```sql
+  SELECT "id", "user_id", "total"
+  FROM "public"."orders"
+  WHERE "user_id" = ANY($1::bigint[]);
+  ```
+  `$1` is passed as a typed native array (`[]int64`, `[]string`), preserving server-side prepared statement cache hits and avoiding Genetic Query Optimizer (GEQO) threshold triggers.
+
+- **> 10,000 keys**: To avoid query text explosion and memory limits, keys are streamed into an `UNLOGGED` temporary scratch table via binary COPY:
+  ```sql
+  CREATE TEMP TABLE "_dbdrain_k_orders" (key text PRIMARY KEY) ON COMMIT DROP;
+  -- Stream parent keys via COPY ...
+  SELECT t.* FROM "public"."orders" t
+  INNER JOIN "_dbdrain_k_orders" k ON k.key = t."user_id"::text;
+  ```
 
 ---
 
@@ -186,21 +256,6 @@ virtual_foreign_keys:
 | `hmac_token` | `tok_<hmac[:16]>` |
 | `redact_password` | `$2a$12$e8rG.e9y1dYv9fD1v1.X7fakehash` |
 
-> [!NOTE]
-> If no config rule matches a column, dbdrain falls back to automatic PII heuristics based on column name patterns (`email`, `*_token`, `password`, etc.).
-
-### Wildcard Matching Rules
-
-| Pattern | Matches |
-|---------|---------|
-| `*` | Everything |
-| `*_token` | `access_token`, `refresh_token`, `api_token` |
-| `user_*` | `user_id`, `user_email`, `user_name` |
-| `*email*` | `email`, `user_email`, `email_address` |
-| `exact` | Only `exact` |
-
-**Priority** (highest wins): exact table + exact column > exact table + glob column > glob table + exact column > all wildcards.
-
 ---
 
 ## Automatic PII Masking Rules
@@ -258,23 +313,19 @@ dbdrain --from "users WHERE id=1"
     │    └─ Queries information_schema + pg_constraint
     │       Discovers columns, PKs, composite FKs, deferrability
     │
-    ├─ internal/graph/graph.go
+    ├─ internal/graph/graph.go & internal/graph/query.go
     │    ├─ Builds directed adjacency-list FK graph
-    │    └─ Registers virtual FK edges from config
+    │    ├─ Registers virtual FK edges from config
+    │    └─ Query planner: BuildANYQuery (= ANY($1::type[])), BuildTempTableJoinQuery
     │
     ├─ internal/graph/tarjan.go
     │    └─ Tarjan's SCC → detects circular FK dependencies
     │       Emits SET CONSTRAINTS ALL DEFERRED when cycles found
     │
-    ├─ internal/drain/export.go
-    │    ├─ REPEATABLE READ snapshot transaction on source
-    │    ├─ Self-ref tables → recursive CTE (WITH RECURSIVE hierarchy AS ...)
-    │    ├─ Upward BFS: mandatory parent traversal (unlimited depth)
-    │    ├─ Downward BFS: child traversal (bounded by --depth, --max-rows-per-table)
-    │    ├─ Polymorphic BFS: virtual FK parent resolution via discriminator column
-    │    ├─ Visited-set deduplication prevents infinite loops
-    │    ├─ Config-rule masking (priority) → auto-heuristic fallback
-    │    └─ Mode A: emit SQL text  |  Mode B: stream to --target via pgx batched inserts
+    ├─ internal/drain/
+    │    ├─ export.go: REPEATABLE READ snapshot, CTE self-ref, BFS upward/downward
+    │    ├─ batcher.go: Query planner router (ANY($1) array vs UNLOGGED temp table COPY + JOIN)
+    │    └─ copy_source.go: CursorCopySource (pgx.CopyFromSource) + sync.Pool O(1) buffer recycling
     │
     ├─ internal/anonymize/mask.go
     │    └─ HMAC-SHA256 masking: fake_email, redact, uuid_remap, hmac_phone, hmac_name, hmac_token
@@ -282,47 +333,9 @@ dbdrain --from "users WHERE id=1"
     ├─ internal/verify/verify.go
     │    └─ LEFT JOIN orphan queries on target DB; exits 1 on violations
     │
-    └─ internal/ui/progress.go
-         ├─ TTY detected → animated Lipgloss spinner + summary table (stderr)
-         ├─ Non-TTY / pipe → pure SQL only, no ANSI codes
-         └─ Integrity section: ✔ pass / ✘ violation list
-```
-
-### Polymorphic Virtual FK Resolution
-
-```yaml
-# dbdrain.yaml
-virtual_foreign_keys:
-  - child_table: comments
-    child_column: commentable_id
-    parent_table_column: commentable_type
-    mappings:
-      post: posts.id
-      video: videos.id
-```
-
-During BFS, when rows are fetched from `comments`, dbdrain captures each `(commentable_type, commentable_id)` pair. It then groups by discriminator value and fetches the corresponding parent rows:
-
-```
-comments rows:
-  {commentable_type: "post",  commentable_id: 5}  → fetch posts WHERE id IN ('5')
-  {commentable_type: "video", commentable_id: 9}  → fetch videos WHERE id IN ('9')
-```
-
-### Self-Referencing Hierarchy
-
-```sql
--- dbdrain generates this automatically:
-WITH RECURSIVE hierarchy AS (
-  SELECT * FROM categories WHERE id = 5          -- seed
-  UNION
-  SELECT t.* FROM categories t                   -- ancestors
-    INNER JOIN hierarchy h ON t.id = h.parent_id
-  UNION
-  SELECT t.* FROM categories t                   -- descendants
-    INNER JOIN hierarchy h ON t.parent_id = h.id
-)
-SELECT DISTINCT * FROM hierarchy;
+    └─ npm/
+         ├─ dbdrain/ (runner.cjs: cross-platform binary launcher for npx/npm)
+         └─ platforms/ (os/cpu targeted packages: linux-x64, darwin-arm64, darwin-x64, win32-x64)
 ```
 
 ---
@@ -330,7 +343,7 @@ SELECT DISTINCT * FROM hierarchy;
 ## Development
 
 ```bash
-# Run all tests (62 tests across 6 packages)
+# Run all tests (71 tests across 6 packages)
 go test ./...
 
 # Cross-compile release binaries
@@ -343,6 +356,11 @@ GOOS=windows GOARCH=amd64  CGO_ENABLED=0 go build -o dist/dbdrain-windows-amd64.
 ---
 
 ## Changelog
+
+### v0.4.0
+- ⚡ **Zero-Copy Streaming Hydration**: Refactored `ExportToTarget()` with `pgx.CopyFromSource` and `sync.Pool` buffer recycling for flat O(1) memory usage during millions of rows extractions.
+- 🚀 **Query Planner & Batching**: Banned raw `WHERE id IN (...)` in child propagation queries; enforced `= ANY($1::type[])` parameterized array queries (≤10k keys) and temporary `UNLOGGED` scratch tables with binary COPY + indexed JOIN (>10k keys).
+- 📦 **npm Distribution Layer**: Created production npm distribution in `npm/` following the `optionalDependencies` pattern with `npx dbdrain` wrapper for Linux, macOS (Apple Silicon & Intel), and Windows.
 
 ### v0.3.0
 - ✨ Declarative `dbdrain.yaml` config: custom masking rules, wildcard/glob matching, transform pipeline

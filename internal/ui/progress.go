@@ -115,7 +115,7 @@ func (sum *Summary) Print(w io.Writer) {
 	}
 
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, headerStyle.Render("  dbdrain v0.3.0  — slice complete ("+modeLabel+")"))
+	fmt.Fprintln(w, headerStyle.Render("  dbdrain v0.4.0  — slice complete ("+modeLabel+")"))
 	fmt.Fprintln(w)
 
 	tables := make([]string, 0, len(sum.Rows))

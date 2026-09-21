@@ -21,7 +21,7 @@ import (
 	"github.com/x7ssss/dbdrain/internal/verify"
 )
 
-const version = "v0.3.0"
+const version = "v0.4.0"
 
 var (
 	source          string

@@ -2,9 +2,12 @@
 dist/
 
 # Go build artifacts
-*.exe
+/*.exe
 *.test
 *.out
+
+# Allow platform binaries in npm packages
+!npm/**/bin/*
 
 # Editor
 .idea/
