@@ -594,3 +594,223 @@ func TestE2E(t *testing.T) {
 
 	t.Logf("✔ Multi-Anchor DAG Closure & Stratified Child Sampling Verified: %d users, %d orders, %d items. 0 violations.", mUserCount, mOrderCount, mItemCount)
 }
+
+func TestPartitionedTableAndReverseSubsetting(t *testing.T) {
+	ctx := context.Background()
+
+	port := findAvailablePort(5434)
+	cfg := embeddedpostgres.DefaultConfig().
+		Port(port).
+		Database("partition_db").
+		Username("postgres").
+		Password("postgres").
+		StartTimeout(45 * time.Second)
+
+	pg := embeddedpostgres.NewDatabase(cfg)
+	if err := pg.Start(); err != nil {
+		t.Fatalf("failed to start embedded postgres on port %d: %v", port, err)
+	}
+	defer func() {
+		if err := pg.Stop(); err != nil {
+			t.Logf("warning: stop embedded postgres: %v", err)
+		}
+	}()
+
+	sourceURI := fmt.Sprintf("postgres://postgres:postgres@localhost:%d/partition_db?sslmode=disable", port)
+
+	sourceConn, err := pgx.Connect(ctx, sourceURI)
+	if err != nil {
+		t.Fatalf("connect to source database: %v", err)
+	}
+	defer sourceConn.Close(ctx)
+
+	setupSQL := `
+	DROP TABLE IF EXISTS customer_notes CASCADE;
+	DROP TABLE IF EXISTS orders_partitioned CASCADE;
+	DROP TABLE IF EXISTS customers CASCADE;
+
+	CREATE TABLE customers (
+		id INT PRIMARY KEY,
+		name VARCHAR(100) NOT NULL
+	);
+
+	CREATE TABLE customer_notes (
+		id INT PRIMARY KEY,
+		customer_id INT NOT NULL REFERENCES customers(id),
+		note TEXT NOT NULL
+	);
+
+	CREATE TABLE orders_partitioned (
+		id INT NOT NULL,
+		customer_id INT NOT NULL REFERENCES customers(id),
+		created_at TIMESTAMP NOT NULL,
+		amount NUMERIC(10,2) NOT NULL,
+		PRIMARY KEY (id, created_at)
+	) PARTITION BY RANGE (created_at);
+
+	CREATE TABLE orders_partitioned_2025 PARTITION OF orders_partitioned
+		FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+	CREATE TABLE orders_partitioned_2026 PARTITION OF orders_partitioned
+		FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+
+	INSERT INTO customers (id, name) VALUES (1, 'Alice'), (2, 'Bob');
+	INSERT INTO customer_notes (id, customer_id, note) VALUES (1, 1, 'VIP customer');
+	INSERT INTO orders_partitioned (id, customer_id, created_at, amount) VALUES
+		(101, 1, '2025-06-15 10:00:00', 150.00),
+		(102, 1, '2026-03-20 14:00:00', 250.00),
+		(103, 2, '2026-08-10 09:30:00', 350.00);
+	`
+	if _, err := sourceConn.Exec(ctx, setupSQL); err != nil {
+		t.Fatalf("create partitioned schema: %v", err)
+	}
+
+	// 1. Test extraction through root relation into SQL dump and verify zero partition routing errors
+	dumpFile := filepath.Join(t.TempDir(), "partition_dump.sql")
+	source = sourceURI
+	fromExprs = []string{"orders_partitioned WHERE id = 101"}
+	output = dumpFile
+	schemaName = "public"
+	anonymize = false
+	salt = "test-salt"
+	maxRowsPerTable = 0
+	maxDepth = 0
+	target = ""
+	configPath = ""
+	doVerify = false
+	rateLimit = 0
+	concurrency = 4
+	safeMode = false
+	maxLag = 30 * time.Second
+	childrenPerParent = 0
+	samplingSeed = "seed"
+	upstream = false
+	bypassRLS = false
+
+	rootCmd.SetArgs([]string{
+		"--source", sourceURI,
+		"--from", "orders_partitioned WHERE id = 101",
+		"--output", dumpFile,
+	})
+
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("dbdrain CLI export failed on partitioned table: %v", err)
+	}
+
+	dumpContent, err := os.ReadFile(dumpFile)
+	if err != nil {
+		t.Fatalf("read dump file: %v", err)
+	}
+	dumpStr := string(dumpContent)
+
+	if !strings.Contains(dumpStr, "PARTITION BY") {
+		t.Errorf("expected dump to contain 'PARTITION BY', got:\n%s", dumpStr)
+	}
+	if !strings.Contains(dumpStr, "PARTITION OF") {
+		t.Errorf("expected dump to contain 'PARTITION OF', got:\n%s", dumpStr)
+	}
+	if !strings.Contains(dumpStr, "101") {
+		t.Errorf("expected dump to contain row 101, got:\n%s", dumpStr)
+	}
+
+	// 2. Test reverse subsetting (--upstream)
+	upstreamDumpFile := filepath.Join(t.TempDir(), "upstream_dump.sql")
+	source = sourceURI
+	fromExprs = []string{"orders_partitioned WHERE id = 101"}
+	output = upstreamDumpFile
+	schemaName = "public"
+	anonymize = false
+	salt = "test-salt"
+	maxRowsPerTable = 0
+	maxDepth = 0
+	target = ""
+	configPath = ""
+	doVerify = false
+	rateLimit = 0
+	concurrency = 4
+	safeMode = false
+	maxLag = 30 * time.Second
+	childrenPerParent = 0
+	samplingSeed = "seed"
+	upstream = true
+	bypassRLS = false
+
+	rootCmd.SetArgs([]string{
+		"--source", sourceURI,
+		"--from", "orders_partitioned WHERE id = 101",
+		"--output", upstreamDumpFile,
+		"--upstream",
+	})
+
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("dbdrain CLI upstream reverse subsetting failed: %v", err)
+	}
+
+	upstreamContent, err := os.ReadFile(upstreamDumpFile)
+	if err != nil {
+		t.Fatalf("read upstream dump file: %v", err)
+	}
+	upstreamStr := string(upstreamContent)
+
+	// Parent customers (Alice) must be present
+	if !strings.Contains(upstreamStr, "Alice") {
+		t.Errorf("expected parent customer 'Alice' in upstream dump, got:\n%s", upstreamStr)
+	}
+	// Sibling customer_notes (VIP customer) must be PRUNED
+	if strings.Contains(upstreamStr, "VIP customer") {
+		t.Errorf("sibling 'VIP customer' from customer_notes was not pruned by --upstream!")
+	}
+
+	// 3. Test RLS awareness and --bypass-rls
+	rlsSQL := `
+	ALTER TABLE customers ENABLE ROW LEVEL SECURITY;
+	CREATE POLICY customer_tenant_policy ON customers FOR ALL TO public USING (id = 2);
+	`
+	if _, err := sourceConn.Exec(ctx, rlsSQL); err != nil {
+		t.Fatalf("enable RLS on customers: %v", err)
+	}
+
+	rlsDumpFile := filepath.Join(t.TempDir(), "rls_dump.sql")
+	source = sourceURI
+	fromExprs = []string{"orders_partitioned WHERE id = 101"}
+	output = rlsDumpFile
+	schemaName = "public"
+	anonymize = false
+	salt = "test-salt"
+	maxRowsPerTable = 0
+	maxDepth = 0
+	target = ""
+	configPath = ""
+	doVerify = false
+	rateLimit = 0
+	concurrency = 4
+	safeMode = false
+	maxLag = 30 * time.Second
+	childrenPerParent = 0
+	samplingSeed = "seed"
+	upstream = true
+	bypassRLS = true
+
+	rootCmd.SetArgs([]string{
+		"--source", sourceURI,
+		"--from", "orders_partitioned WHERE id = 101",
+		"--output", rlsDumpFile,
+		"--upstream",
+		"--bypass-rls",
+	})
+
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("dbdrain CLI with --bypass-rls failed: %v", err)
+	}
+
+	rlsContent, err := os.ReadFile(rlsDumpFile)
+	if err != nil {
+		t.Fatalf("read rls dump file: %v", err)
+	}
+	rlsStr := string(rlsContent)
+	if !strings.Contains(rlsStr, "Alice") {
+		t.Errorf("expected parent customer 'Alice' to be extracted when bypassing RLS, got:\n%s", rlsStr)
+	}
+
+	t.Logf("✔ Declarative partitioning, reverse subsetting upstream pruning, and RLS bypass verified.")
+}

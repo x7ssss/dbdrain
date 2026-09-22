@@ -26,7 +26,7 @@ import (
 	"github.com/x7ssss/dbdrain/internal/verify"
 )
 
-const version = "v0.8.0"
+const version = "v0.9.0"
 
 var (
 	source            string
@@ -46,6 +46,8 @@ var (
 	maxLag            time.Duration
 	childrenPerParent int
 	samplingSeed      string
+	upstream          bool
+	bypassRLS         bool
 )
 
 var rootCmd = &cobra.Command{
@@ -101,6 +103,8 @@ func init() {
 	rootCmd.Flags().DurationVar(&maxLag, "max-lag", 30*time.Second, "Maximum allowed replica lag before pausing extraction")
 	rootCmd.Flags().IntVar(&childrenPerParent, "children-per-parent", 0, "Limit number of child rows pulled per parent entity down the DAG (0 = unlimited)")
 	rootCmd.Flags().StringVar(&samplingSeed, "seed", "dbdrain-sampling", "Deterministic hash seed for stratified child sampling")
+	rootCmd.Flags().BoolVar(&upstream, "upstream", false, "Treat --from as an isolated leaf anchor and perform strict upstream-only reverse subsetting")
+	rootCmd.Flags().BoolVar(&bypassRLS, "bypass-rls", false, "Bypass Row-Level Security by executing SET row_security = off on PostgreSQL extraction connection")
 
 	rootCmd.MarkFlagRequired("source")
 	rootCmd.MarkFlagRequired("from")
@@ -256,6 +260,13 @@ func runDrain(cmd *cobra.Command, args []string) error {
 		}
 		defer conn.Close(ctx)
 
+		if bypassRLS {
+			if _, err := conn.Exec(ctx, "SET row_security = off;"); err != nil {
+				stopSpinner()
+				return fmt.Errorf("bypass row-level security: %w", err)
+			}
+		}
+
 		sourceDB = db.NewPostgresSource(conn)
 
 		spinnerMsg("Introspecting PostgreSQL schema...")
@@ -335,6 +346,9 @@ func runDrain(cmd *cobra.Command, args []string) error {
 		MaxRowsPerTable:   maxRowsPerTable,
 		MaxDepth:          maxDepth,
 		Rules:             cfg.Rules,
+		Associations:      cfg.Associations,
+		Upstream:          upstream,
+		BypassRLS:         bypassRLS,
 		Limiter:           lim,
 		Safety:            poller,
 		ChildrenPerParent: childrenPerParent,
@@ -410,11 +424,14 @@ func runDrain(cmd *cobra.Command, args []string) error {
 				}
 				for _, v := range violations {
 					uiViolations = append(uiViolations, ui.Violation{
-						ChildTable:   v.ChildTable,
-						ChildColumn:  v.ChildColumn,
-						ParentTable:  v.ParentTable,
-						ParentColumn: v.ParentColumn,
-						OrphanCount:  v.OrphanCount,
+						ChildTable:          v.ChildTable,
+						ChildColumn:         v.ChildColumn,
+						ParentTable:         v.ParentTable,
+						ParentColumn:        v.ParentColumn,
+						Status:              v.Status,
+						OrphanCount:         v.OrphanCount,
+						PolicyExcludedCount: v.PolicyExcludedCount,
+						RLSActive:           v.RLSActive,
 					})
 				}
 			}
@@ -459,11 +476,14 @@ func runDrain(cmd *cobra.Command, args []string) error {
 				}
 				for _, v := range violations {
 					uiViolations = append(uiViolations, ui.Violation{
-						ChildTable:   v.ChildTable,
-						ChildColumn:  v.ChildColumn,
-						ParentTable:  v.ParentTable,
-						ParentColumn: v.ParentColumn,
-						OrphanCount:  v.OrphanCount,
+						ChildTable:          v.ChildTable,
+						ChildColumn:         v.ChildColumn,
+						ParentTable:         v.ParentTable,
+						ParentColumn:        v.ParentColumn,
+						Status:              v.Status,
+						OrphanCount:         v.OrphanCount,
+						PolicyExcludedCount: v.PolicyExcludedCount,
+						RLSActive:           v.RLSActive,
 					})
 				}
 			}
@@ -493,11 +513,14 @@ func runDrain(cmd *cobra.Command, args []string) error {
 				}
 				for _, v := range violations {
 					uiViolations = append(uiViolations, ui.Violation{
-						ChildTable:   v.ChildTable,
-						ChildColumn:  v.ChildColumn,
-						ParentTable:  v.ParentTable,
-						ParentColumn: v.ParentColumn,
-						OrphanCount:  v.OrphanCount,
+						ChildTable:          v.ChildTable,
+						ChildColumn:         v.ChildColumn,
+						ParentTable:         v.ParentTable,
+						ParentColumn:        v.ParentColumn,
+						Status:              v.Status,
+						OrphanCount:         v.OrphanCount,
+						PolicyExcludedCount: v.PolicyExcludedCount,
+						RLSActive:           v.RLSActive,
 					})
 				}
 			}
@@ -526,8 +549,17 @@ func runDrain(cmd *cobra.Command, args []string) error {
 			sum.Print(os.Stderr)
 		} else if doVerify && len(uiViolations) > 0 {
 			for _, v := range uiViolations {
-				fmt.Fprintf(os.Stderr, "ORPHAN: %s.%s → %s.%s : %d rows\n",
-					v.ChildTable, v.ChildColumn, v.ParentTable, v.ParentColumn, v.OrphanCount)
+				status := v.Status
+				if status == "" {
+					status = "Corrupted/Orphan"
+				}
+				if status == "Policy-Excluded" || v.PolicyExcludedCount > 0 {
+					fmt.Fprintf(os.Stderr, "POLICY-EXCLUDED: %s.%s → %s.%s : %d rows\n",
+						v.ChildTable, v.ChildColumn, v.ParentTable, v.ParentColumn, v.PolicyExcludedCount)
+				} else {
+					fmt.Fprintf(os.Stderr, "ORPHAN: %s.%s → %s.%s : %d rows [%s]\n",
+						v.ChildTable, v.ChildColumn, v.ParentTable, v.ParentColumn, v.OrphanCount, status)
+				}
 			}
 		}
 

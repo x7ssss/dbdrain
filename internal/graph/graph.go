@@ -70,38 +70,78 @@ func New(schema *introspect.Schema, virtualFKs ...[]VirtualFKInput) *Graph {
 	}
 
 	for table := range schema.Columns {
+		if schema != nil && schema.IsChildPartition(table) {
+			continue
+		}
 		g.Nodes[table] = &Node{Table: table}
 	}
 
+	if schema != nil {
+		for root := range schema.PartitionedTables {
+			if _, ok := g.Nodes[root]; !ok {
+				g.Nodes[root] = &Node{Table: root}
+			}
+		}
+	}
+
 	for _, fk := range schema.ForeignKeys {
-		if _, ok := g.Nodes[fk.FromTable]; !ok {
-			g.Nodes[fk.FromTable] = &Node{Table: fk.FromTable}
+		fromTable := fk.FromTable
+		toTable := fk.ToTable
+		if schema != nil {
+			fromTable = schema.RootPartition(fromTable)
+			toTable = schema.RootPartition(toTable)
 		}
-		if _, ok := g.Nodes[fk.ToTable]; !ok {
-			g.Nodes[fk.ToTable] = &Node{Table: fk.ToTable}
+
+		if _, ok := g.Nodes[fromTable]; !ok {
+			g.Nodes[fromTable] = &Node{Table: fromTable}
 		}
+		if _, ok := g.Nodes[toTable]; !ok {
+			g.Nodes[toTable] = &Node{Table: toTable}
+		}
+
+		// Deduplicate identical edges mapped to root partitions
+		exists := false
+		for _, existing := range g.OutEdges[fromTable] {
+			if existing.ToTable == toTable &&
+				sliceEqual(existing.FromColumns, fk.FromColumns) &&
+				sliceEqual(existing.ToColumns, fk.ToColumns) {
+				exists = true
+				break
+			}
+		}
+		if exists {
+			continue
+		}
+
 		e := Edge{
-			FromTable:   fk.FromTable,
-			ToTable:     fk.ToTable,
+			FromTable:   fromTable,
+			ToTable:     toTable,
 			FromColumns: fk.FromColumns,
 			ToColumns:   fk.ToColumns,
 			FK:          fk,
 		}
-		g.OutEdges[fk.FromTable] = append(g.OutEdges[fk.FromTable], e)
-		g.InEdges[fk.ToTable] = append(g.InEdges[fk.ToTable], e)
+		g.OutEdges[fromTable] = append(g.OutEdges[fromTable], e)
+		g.InEdges[toTable] = append(g.InEdges[toTable], e)
 	}
 
 	// Register virtual FK edges.
 	for _, vfks := range virtualFKs {
 		for _, vfk := range vfks {
+			childTable := vfk.ChildTable
+			if schema != nil {
+				childTable = schema.RootPartition(childTable)
+			}
 			ve := VirtualEdge{
-				ChildTable:       vfk.ChildTable,
+				ChildTable:       childTable,
 				ChildColumn:      vfk.ChildColumn,
 				DiscriminatorCol: vfk.DiscriminatorCol,
 				Mappings:         make(map[string]TableColumn, len(vfk.Mappings)),
 			}
 			for discVal, tableCol := range vfk.Mappings {
 				tc := parseTableCol(tableCol)
+				if schema != nil {
+					tc.Table = schema.RootPartition(tc.Table)
+				}
 				ve.Mappings[discVal] = tc
 				// Register parent table as a node if not already present.
 				if _, ok := g.Nodes[tc.Table]; !ok {
@@ -109,14 +149,26 @@ func New(schema *introspect.Schema, virtualFKs ...[]VirtualFKInput) *Graph {
 				}
 			}
 			// Register child table as a node if not already present.
-			if _, ok := g.Nodes[vfk.ChildTable]; !ok {
-				g.Nodes[vfk.ChildTable] = &Node{Table: vfk.ChildTable}
+			if _, ok := g.Nodes[childTable]; !ok {
+				g.Nodes[childTable] = &Node{Table: childTable}
 			}
-			g.VirtualEdges[vfk.ChildTable] = append(g.VirtualEdges[vfk.ChildTable], ve)
+			g.VirtualEdges[childTable] = append(g.VirtualEdges[childTable], ve)
 		}
 	}
 
 	return g
+}
+
+func sliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // parseTableCol splits a "table.column" string into TableColumn.

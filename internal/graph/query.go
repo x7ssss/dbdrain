@@ -46,6 +46,31 @@ func BuildANYQuery(schema, table string, colNames []string, fkCol, arrayType str
 	return q
 }
 
+// BuildANYQueryWithCondition constructs a parameterized SELECT query using WHERE col = ANY($1::type[])
+// and an optional additional SQL predicate condition.
+func BuildANYQueryWithCondition(schema, table string, colNames []string, fkCol, arrayType string, limit int, condition string) string {
+	quotedCols := make([]string, len(colNames))
+	for i, c := range colNames {
+		quotedCols[i] = QuoteIdent(c)
+	}
+
+	q := fmt.Sprintf(
+		`SELECT %s FROM %s.%s WHERE %s = ANY($1::%s[])`,
+		strings.Join(quotedCols, ", "),
+		QuoteIdent(schema),
+		QuoteIdent(table),
+		QuoteIdent(fkCol),
+		arrayType,
+	)
+	if condition != "" {
+		q += fmt.Sprintf(" AND (%s)", condition)
+	}
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	return q
+}
+
 // FormatANYParam converts string IDs into typed Go values suitable for pgx driver encoding.
 // For bigint columns, it parses string IDs to int64 slice.
 // If any ID cannot be parsed as int64, it safely falls back to a []string slice.

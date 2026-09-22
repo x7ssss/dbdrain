@@ -27,6 +27,9 @@
 
 - 🪶 **Native SQLite Target Hydration** — Transpile production PostgreSQL and MySQL schemas on-the-fly into SQLite DDL and hydrate local development databases (e.g. `--target ./dev.db`) with `PRAGMA defer_foreign_keys = ON`
 - 🎯 **Multi-Anchor DAG Closures** — Repeatable `--from` flag extracts unified slices across heterogeneous roots with global entity deduplication preventing Cartesian explosion
+- 🌲 **Reverse Subsetting & Upstream Ancestry Pruning** — `--upstream` treats anchor as an isolated leaf incident, computing strict upward-only recursive DAG closure while pruning all sibling and downstream branches
+- 🗄️ **Declarative PostgreSQL Partitioning** — Transparently introspects and reconstructs partition trees (`PARTITION BY RANGE/LIST/HASH`), routing streams through the logical root relation
+- 🛡️ **Row-Level Security (RLS) Awareness** — `--bypass-rls` executes `SET row_security = off;` on Postgres connections; `--verify` distinctly categorizes `Valid`, `Policy-Excluded`, and `Corrupted/Orphan`
 - ✂️ **Stratified Child Sampling** — `--children-per-parent N` uniformly samples child entities across parent nodes via SQL window ranking functions while preserving referential integrity
 - ⏩ **Keyset Seek Pagination** — O(1) cursor seek pagination (`WHERE (table, pk) > ($1, $2)`) eliminates `OFFSET` scan degradation during batch traversal
 - ⚡ **Multi-Engine Support** — Native support for PostgreSQL 12+, MySQL 8.0+ / MariaDB 10.5+, and SQLite 3
@@ -213,6 +216,29 @@ ORDER BY `user_id`, `id` LIMIT 1000;
 ```
 
 This guarantees **$O(1)$ cursor seek time** regardless of whether page 1 or page 50,000 is being traversed.
+
+### 4. Target-Directed Reverse Slicing (`--upstream`)
+When diagnosing production incidents or extracting isolated test cases (e.g. `--from "charges WHERE id = 98234" --upstream`), standard forward subsetting pulls every sibling charge, invoice item, customer review, and audit event, exponentially bloating the slice.
+
+`--upstream` flips the traversal engine into strict reverse mode:
+- **Leaf-Anchor Isolation**: Treats the `--from` seed as an isolated leaf/incident anchor.
+- **Upward-Only Closure**: Performs a strict recursive upward DAG closure along outgoing foreign keys, pruning all sibling down-traversals (never pulling siblings of parents or unrelated child tables).
+- **Cycle Avoidance via Path Identity**: Maintains an identity path array (`visited_path`) to prevent circular parent loops.
+- **Multi-Path Convergence**: When multiple FK paths converge on the same ancestor (e.g. `charges → invoices → customers` AND `charges → payments → customers`), computes the exact union without Cartesian duplication.
+
+### 5. Declarative PostgreSQL Partitioning (PostgreSQL 10-16+)
+- **Catalog Introspection**: Introspects `pg_partitioned_table`, `pg_inherits`, and `pg_class.relkind = 'p'` to map partitioned roots and child partition bounds.
+- **Logical DAG Representation**: Partitioned tables are modeled as a single logical root node in the dependency graph, preserving child partition hierarchies and bounds expressions.
+- **Transparent Root Routing**: Streams queries directly through the logical root relation so PostgreSQL handles transparent partition pruning and routing.
+- **Target DDL Emission**: Automatically emits partition strategy DDL (`PARTITION BY RANGE/LIST/HASH`), attaches child partition tables with their bounds expressions, and streams rows without routing errors.
+
+### 6. Row-Level Security (RLS) & Tenant Visibility
+- **`--bypass-rls` Flag**: When enabled, executes `SET row_security = off;` on the PostgreSQL extraction connection (fails fast if the user lacks `BYPASSRLS` or superuser privileges).
+- **Three-Tier Verification Auditing**:
+  During `--verify`, `dbdrain` inspects `relrowsecurity` on parent tables and categorizes integrity results distinctly:
+  * `Valid`: Parent exists and is visible.
+  * `Policy-Excluded`: Parent exists globally in the database, but is filtered by the tenant's current RLS policy.
+  * `Corrupted/Orphan`: Parent row is physically missing.
 
 ---
 
@@ -407,6 +433,8 @@ dbdrain \
 | `--concurrency` | int | `4` | Maximum parallel extraction workers |
 | `--safe-mode` | bool | `false` | Enables active background cluster health polling and automatic adaptive throttling |
 | `--max-lag` | duration | `30s` | Maximum allowed replica lag before pausing extraction |
+| `--upstream` | bool | `false` | Treat `--from` as an isolated leaf anchor; perform strict upward-only reverse subsetting |
+| `--bypass-rls` | bool | `false` | Bypass Row-Level Security via `SET row_security = off;` on PostgreSQL connection |
 
 ---
 
@@ -445,6 +473,17 @@ virtual_foreign_keys:
     mappings:
       post: posts.id
       video: videos.id
+
+associations:
+  # Skip FK traversal entirely; coerces dangling nullable FK column to NULL
+  - source: charges
+    target: audit_trail
+    restriction: false
+
+  # Conditional SQL predicate for selective relationship extraction
+  - source: charges
+    target: analytics_events
+    restriction: "event_type = 'billing'"
 ```
 
 ### Available Transforms
@@ -557,6 +596,23 @@ GOOS=windows GOARCH=amd64  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o 
 ---
 
 ## Changelog
+
+### v0.9.0
+- 🌲 **Reverse Subsetting & Upstream Ancestry Pruning (`--upstream`)**: Treats `--from` as an isolated leaf incident anchor, computing a strict upward-only recursive DAG closure along outgoing foreign keys while pruning all sibling and downstream branches.
+- 🔄 **Path-Based Cycle Detection & Multi-Path Convergence**: Employs an identity path array (`visited_path`) to prevent circular loops while correctly computing ancestor unions across convergent FK paths without Cartesian duplication.
+- 🗄️ **Declarative PostgreSQL Partitioning (PostgreSQL 10-16+)**: Introspects `pg_partitioned_table`, `pg_inherits`, and `relkind = 'p'`. Models partitioned tables as a single logical root in the dependency graph while retaining child partition bounds and emitting partition strategy DDL (`PARTITION BY RANGE/LIST/HASH`).
+- 🛡️ **Row-Level Security (RLS) & Tenant Visibility (`--bypass-rls`)**: Executes `SET row_security = off;` on Postgres extraction connections; `--verify` distinctly categorizes integrity checks into `Valid`, `Policy-Excluded` (parent exists globally but hidden by RLS), and `Corrupted/Orphan` (parent physically missing).
+- 🚫 **Conditional FK Restrictions & Dangling Null Pruning (`dbdrain.yaml`)**: Supports `restriction: false` to skip FK relationships entirely and automatically coerces dangling nullable FK columns to `NULL`, as well as conditional SQL predicates.
+
+### v0.8.0
+- 🎯 **Multi-Anchor DAG Closures**: Repeatable `--from` flag extracts unified slices across heterogeneous roots with global entity deduplication.
+- ✂️ **Stratified Child Sampling (`--children-per-parent`)**: Uniformly samples child entities per parent via window ranking functions while strictly guaranteeing referential invariants.
+- ⏩ **Keyset Seek Pagination**: O(1) cursor seek pagination (`WHERE (table, pk) > ($1, $2)`) eliminates `OFFSET` scan degradation.
+
+### v0.7.0
+- 🛡️ **Autonomous Cluster Health Polling (`--safe-mode`)**: Adaptive backpressure monitoring for InnoDB history list length and replication lag.
+- 🚦 **Token-Bucket Rate Limiter & Concurrency Control**: `--rate-limit` and `--concurrency` controls.
+- ⚡ **Fail-Fast Session Timeouts**: Statement, lock, and idle timeouts preventing catalog contention.
 
 ### v0.6.0
 - 🪶 **Native SQLite Target Transpilation & Hydration**: Direct subset hydration into local SQLite database files (e.g. `--target ./dev.db`) using pure-Go `modernc.org/sqlite` without CGO.

@@ -136,3 +136,50 @@ func TestViolationZeroCount(t *testing.T) {
 		t.Error("zero-count rows should not become violations")
 	}
 }
+
+func TestFormatReportPolicyExcluded(t *testing.T) {
+	violations := []Violation{
+		{
+			ChildTable:          "charges",
+			ChildColumn:         "customer_id",
+			ParentTable:         "customers",
+			ParentColumn:        "id",
+			Status:              StatusPolicyExcluded,
+			PolicyExcludedCount: 3,
+			RLSActive:           true,
+		},
+		{
+			ChildTable:   "orders",
+			ChildColumn:  "user_id",
+			ParentTable:  "users",
+			ParentColumn: "id",
+			Status:       StatusCorrupted,
+			OrphanCount:  2,
+		},
+	}
+	report := FormatReport(violations)
+	if !strings.Contains(report, "Policy-Excluded") {
+		t.Errorf("expected 'Policy-Excluded' in report, got: %s", report)
+	}
+	if !strings.Contains(report, "3 row(s)") {
+		t.Errorf("expected '3 row(s)' in report, got: %s", report)
+	}
+	if !strings.Contains(report, "Corrupted/Orphan") {
+		t.Errorf("expected 'Corrupted/Orphan' in report, got: %s", report)
+	}
+	if !strings.Contains(report, "2 orphaned row(s)") {
+		t.Errorf("expected '2 orphaned row(s)' in report, got: %s", report)
+	}
+}
+
+func TestCategorizationConstants(t *testing.T) {
+	if StatusValid != "Valid" {
+		t.Errorf("expected StatusValid == 'Valid', got %q", StatusValid)
+	}
+	if StatusPolicyExcluded != "Policy-Excluded" {
+		t.Errorf("expected StatusPolicyExcluded == 'Policy-Excluded', got %q", StatusPolicyExcluded)
+	}
+	if StatusCorrupted != "Corrupted/Orphan" {
+		t.Errorf("expected StatusCorrupted == 'Corrupted/Orphan', got %q", StatusCorrupted)
+	}
+}

@@ -257,3 +257,54 @@ func TestParseTableColumnInvalid(t *testing.T) {
 		t.Error("expected error for empty table")
 	}
 }
+
+func TestLoadAssociations(t *testing.T) {
+	yaml := `
+associations:
+  - source: charges
+    target: audit_trail
+    restriction: false
+  - source: charges
+    target: analytics_events
+    restriction: "event_type = 'billing'"
+`
+	tmp := filepath.Join(t.TempDir(), "dbdrain.yaml")
+	if err := os.WriteFile(tmp, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(tmp)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if len(cfg.Associations) != 2 {
+		t.Fatalf("expected 2 associations, got %d", len(cfg.Associations))
+	}
+
+	a1 := cfg.FindAssociation("charges", "audit_trail")
+	if a1 == nil {
+		t.Fatal("expected to find charges -> audit_trail association")
+	}
+	if !a1.IsSkipped() {
+		t.Errorf("expected audit_trail association to be skipped (restriction: false)")
+	}
+	if a1.Condition() != "" {
+		t.Errorf("expected empty condition, got %q", a1.Condition())
+	}
+
+	a2 := cfg.FindAssociation("charges", "analytics_events")
+	if a2 == nil {
+		t.Fatal("expected to find charges -> analytics_events association")
+	}
+	if a2.IsSkipped() {
+		t.Errorf("expected analytics_events association NOT to be skipped")
+	}
+	if a2.Condition() != "event_type = 'billing'" {
+		t.Errorf("expected event_type = 'billing', got %q", a2.Condition())
+	}
+
+	// Missing association
+	if cfg.FindAssociation("charges", "users") != nil {
+		t.Errorf("expected nil for unknown association")
+	}
+}

@@ -54,10 +54,71 @@ type VirtualForeignKey struct {
 	Mappings          map[string]string  `yaml:"mappings"`            // "post" -> "posts.id"
 }
 
+// RestrictionValue represents the restriction field of an Association.
+// It can be a boolean (e.g. `false` to skip FK traversal entirely)
+// or a SQL predicate string (e.g. `"event_type = 'billing'"`).
+type RestrictionValue struct {
+	Skip      bool   // true when restriction: false
+	Condition string // SQL predicate when restriction is a string
+}
+
+func (r *RestrictionValue) UnmarshalYAML(value *yaml.Node) error {
+	if value == nil {
+		return nil
+	}
+	var b bool
+	if err := value.Decode(&b); err == nil {
+		r.Skip = !b // restriction: false -> Skip is true
+		r.Condition = ""
+		return nil
+	}
+	var s string
+	if err := value.Decode(&s); err == nil {
+		r.Skip = false
+		r.Condition = s
+		return nil
+	}
+	return fmt.Errorf("restriction must be boolean or string, got %v", value.Tag)
+}
+
+func (r RestrictionValue) MarshalYAML() (any, error) {
+	if r.Skip {
+		return false, nil
+	}
+	if r.Condition != "" {
+		return r.Condition, nil
+	}
+	return nil, nil
+}
+
+// Association defines relationship restrictions or conditional SQL predicates on FK traversals.
+type Association struct {
+	Source      string           `yaml:"source"`
+	Target      string           `yaml:"target"`
+	Restriction RestrictionValue `yaml:"restriction"`
+}
+
+// IsSkipped returns true if this association is explicitly restricted/skipped.
+func (a *Association) IsSkipped() bool {
+	if a == nil {
+		return false
+	}
+	return a.Restriction.Skip
+}
+
+// Condition returns the conditional SQL predicate string, if any.
+func (a *Association) Condition() string {
+	if a == nil {
+		return ""
+	}
+	return a.Restriction.Condition
+}
+
 // Config is the top-level structure for dbdrain.yaml.
 type Config struct {
 	Rules              []Rule              `yaml:"rules"`
 	VirtualForeignKeys []VirtualForeignKey `yaml:"virtual_foreign_keys"`
+	Associations       []Association       `yaml:"associations"`
 }
 
 // Load reads the YAML config from path. Returns an empty Config if the file does not exist.
@@ -107,6 +168,21 @@ func (c *Config) FindRule(table, column string) *Rule {
 		return nil
 	}
 	return found
+}
+
+// FindAssociation returns the Association matching (source, target), or nil if none match.
+func (c *Config) FindAssociation(source, target string) *Association {
+	if c == nil {
+		return nil
+	}
+	for i := range c.Associations {
+		a := &c.Associations[i]
+		if (a.Source == source || WildcardMatch(a.Source, source)) &&
+			(a.Target == target || WildcardMatch(a.Target, target)) {
+			return a
+		}
+	}
+	return nil
 }
 
 // matchScore rates how specifically a (ruleTable, ruleCol) pair matches (table, col).

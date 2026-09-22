@@ -118,6 +118,8 @@ func (s *CursorCopySource) Next() bool {
 
 		if s.exporter != nil {
 			s.exporter.applyMasking(s.table, s.cols, buf)
+			s.exporter.coerceDanglingNulls(s.table, s.cols, buf)
+			s.exporter.recordFKValues(s.table, s.cols, buf)
 			s.exporter.capturePolyData(s.table, s.colNames, buf)
 			s.exporter.RowCounts[s.table]++
 		}

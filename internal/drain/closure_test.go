@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/x7ssss/dbdrain/internal/config"
 	"github.com/x7ssss/dbdrain/internal/graph"
 	"github.com/x7ssss/dbdrain/internal/introspect"
 )
@@ -108,5 +109,134 @@ func TestStratifiedChildQueryReferentialInvariant(t *testing.T) {
 	// Deterministic MD5 hash order verification
 	if !strings.Contains(q5, "ORDER BY MD5(CAST(c.\"id\" AS text) || $2)") {
 		t.Errorf("query missing deterministic hash ordering: %s", q5)
+	}
+}
+
+func TestReverseTraversalMinimalUpstreamClosure(t *testing.T) {
+	// Schema:
+	// customers <- invoices <- charges (incident leaf)
+	// Siblings/children that MUST be pruned:
+	// customer_notes -> customers (sibling of invoices)
+	// invoice_items -> invoices (sibling of charges)
+	// audit_trail -> charges (child of charges)
+	schema := makeSchema(map[string][]string{
+		"customers":      {"id", "name"},
+		"invoices":       {"id", "customer_id", "total"},
+		"charges":        {"id", "invoice_id", "amount"},
+		"customer_notes": {"id", "customer_id", "note"},
+		"invoice_items":  {"id", "invoice_id", "item"},
+		"audit_trail":    {"id", "charge_id", "action"},
+	}, []introspect.ForeignKey{
+		{FromTable: "invoices", FromColumns: []string{"customer_id"}, ToTable: "customers", ToColumns: []string{"id"}},
+		{FromTable: "charges", FromColumns: []string{"invoice_id"}, ToTable: "invoices", ToColumns: []string{"id"}},
+		{FromTable: "customer_notes", FromColumns: []string{"customer_id"}, ToTable: "customers", ToColumns: []string{"id"}},
+		{FromTable: "invoice_items", FromColumns: []string{"invoice_id"}, ToTable: "invoices", ToColumns: []string{"id"}},
+		{FromTable: "audit_trail", FromColumns: []string{"charge_id"}, ToTable: "charges", ToColumns: []string{"id"}},
+	})
+
+	g := graph.New(schema)
+	closure := g.UpstreamClosure([]string{"charges"}, nil)
+
+	closureMap := make(map[string]bool)
+	for _, tbl := range closure {
+		closureMap[tbl] = true
+	}
+
+	// Must include anchor charges and ancestors invoices, customers
+	if !closureMap["charges"] {
+		t.Errorf("expected closure to contain 'charges'")
+	}
+	if !closureMap["invoices"] {
+		t.Errorf("expected closure to contain ancestor 'invoices'")
+	}
+	if !closureMap["customers"] {
+		t.Errorf("expected closure to contain ancestor 'customers'")
+	}
+
+	// Must strictly PRUNE all siblings and downward children (zero sibling rows/tables)
+	siblingsAndChildren := []string{"customer_notes", "invoice_items", "audit_trail"}
+	for _, s := range siblingsAndChildren {
+		if closureMap[s] {
+			t.Errorf("reverse traversal failed to prune sibling/child table %q: closure=%v", s, closure)
+		}
+	}
+}
+
+func TestConditionalFKRestrictionsAndDanglingNulls(t *testing.T) {
+	schema := &introspect.Schema{
+		Columns: map[string][]introspect.Column{
+			"charges": {
+				{Name: "id", DataType: "text", Ordinal: 1, IsNullable: false},
+				{Name: "amount", DataType: "numeric", Ordinal: 2, IsNullable: false},
+				{Name: "audit_id", DataType: "text", Ordinal: 3, IsNullable: true},
+				{Name: "not_null_audit_id", DataType: "text", Ordinal: 4, IsNullable: false},
+			},
+			"audit_trail": {
+				{Name: "id", DataType: "text", Ordinal: 1, IsNullable: false},
+			},
+			"analytics_events": {
+				{Name: "id", DataType: "text", Ordinal: 1, IsNullable: false},
+			},
+		},
+		PrimaryKeys: map[string][]string{
+			"charges":          {"id"},
+			"audit_trail":      {"id"},
+			"analytics_events": {"id"},
+		},
+		ForeignKeys: []introspect.ForeignKey{
+			{FromTable: "charges", FromColumns: []string{"audit_id"}, ToTable: "audit_trail", ToColumns: []string{"id"}},
+			{FromTable: "charges", FromColumns: []string{"not_null_audit_id"}, ToTable: "audit_trail", ToColumns: []string{"id"}},
+		},
+	}
+
+	g := graph.New(schema)
+	sccs := graph.TarjanSCC(g)
+
+	cfg := Config{
+		Associations: []config.Association{
+			{
+				Source:      "charges",
+				Target:      "audit_trail",
+				Restriction: config.RestrictionValue{Skip: true},
+			},
+			{
+				Source:      "charges",
+				Target:      "analytics_events",
+				Restriction: config.RestrictionValue{Condition: "event_type = 'billing'"},
+			},
+		},
+	}
+
+	exp := New(nil, schema, g, sccs, cfg)
+
+	// Verify predicate finding
+	assoc := exp.findAssociation("charges", "analytics_events")
+	if assoc == nil || assoc.Condition() != "event_type = 'billing'" {
+		t.Fatalf("expected predicate \"event_type = 'billing'\", got %+v", assoc)
+	}
+
+	// Verify skipped association
+	skippedAssoc := exp.findAssociation("charges", "audit_trail")
+	if skippedAssoc == nil || !skippedAssoc.IsSkipped() {
+		t.Fatalf("expected audit_trail to be skipped")
+	}
+
+	// Test dangling NULL coercion
+	cols := schema.Columns["charges"]
+	vals := []any{"ch_100", 250.50, "aud_999", "aud_fixed"}
+
+	exp.coerceDanglingNulls("charges", cols, vals)
+
+	// Nullable audit_id (index 2) must be coerced to nil
+	if vals[2] != nil {
+		t.Errorf("expected nullable FK audit_id to be coerced to nil, got %v", vals[2])
+	}
+	// Non-nullable audit_id (index 3) must NOT be coerced to nil
+	if vals[3] != "aud_fixed" {
+		t.Errorf("expected non-nullable FK not_null_audit_id to remain %q, got %v", "aud_fixed", vals[3])
+	}
+	// Non-FK columns must remain unchanged
+	if vals[0] != "ch_100" || vals[1] != 250.50 {
+		t.Errorf("unexpected changes to non-FK columns: %v", vals)
 	}
 }

@@ -68,7 +68,23 @@ func queryByIDs(
 	ids []string,
 	limit int,
 ) (db.RowIterator, error) {
-	return queryByIDsWithSampling(ctx, tx, engine, schema, table, colNames, fkCol, fkColInfo, ids, limit, StratifiedSampling{})
+	return queryByIDsWithSamplingAndCondition(ctx, tx, engine, schema, table, colNames, fkCol, fkColInfo, ids, limit, StratifiedSampling{}, "")
+}
+
+// queryByIDsWithCondition selects rows with an optional SQL condition predicate.
+func queryByIDsWithCondition(
+	ctx context.Context,
+	tx db.SourceTx,
+	engine db.EngineType,
+	schema, table string,
+	colNames []string,
+	fkCol string,
+	fkColInfo *introspect.Column,
+	ids []string,
+	limit int,
+	condition string,
+) (db.RowIterator, error) {
+	return queryByIDsWithSamplingAndCondition(ctx, tx, engine, schema, table, colNames, fkCol, fkColInfo, ids, limit, StratifiedSampling{}, condition)
 }
 
 // queryByIDsWithSampling executes batch queries with optional stratified child sampling using window ranking.
@@ -84,17 +100,33 @@ func queryByIDsWithSampling(
 	limit int,
 	sampling StratifiedSampling,
 ) (db.RowIterator, error) {
+	return queryByIDsWithSamplingAndCondition(ctx, tx, engine, schema, table, colNames, fkCol, fkColInfo, ids, limit, sampling, "")
+}
+
+func queryByIDsWithSamplingAndCondition(
+	ctx context.Context,
+	tx db.SourceTx,
+	engine db.EngineType,
+	schema, table string,
+	colNames []string,
+	fkCol string,
+	fkColInfo *introspect.Column,
+	ids []string,
+	limit int,
+	sampling StratifiedSampling,
+	condition string,
+) (db.RowIterator, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
 
 	if engine == db.EngineMySQL {
-		return queryByIDsMySQLWithSampling(ctx, tx, schema, table, colNames, fkCol, ids, limit, sampling)
+		return queryByIDsMySQLWithSamplingAndCondition(ctx, tx, schema, table, colNames, fkCol, ids, limit, sampling, condition)
 	}
 
 	// Postgres path
 	if len(ids) > anyArrayThreshold {
-		return queryByIDsTempTableWithSampling(ctx, tx, schema, table, colNames, fkCol, ids, limit, sampling)
+		return queryByIDsTempTableWithSamplingAndCondition(ctx, tx, schema, table, colNames, fkCol, ids, limit, sampling, condition)
 	}
 
 	arrayType := "text"
@@ -112,7 +144,13 @@ func queryByIDsWithSampling(
 			seed = "dbdrain-sampling"
 		}
 		q = graph.BuildStratifiedChildQuery(schema, table, colNames, fkCol, sampling.PKCol, arrayType, sampling.ChildrenPerParent, limit)
+		if condition != "" {
+			q += fmt.Sprintf(" AND (%s)", condition)
+		}
 		args = []any{param, seed}
+	} else if condition != "" {
+		q = graph.BuildANYQueryWithCondition(schema, table, colNames, fkCol, arrayType, limit, condition)
+		args = []any{param}
 	} else {
 		q = buildANYQuery(schema, table, colNames, fkCol, arrayType, limit)
 		args = []any{param}
@@ -137,7 +175,7 @@ func queryByIDsMySQL(
 	ids []string,
 	limit int,
 ) (db.RowIterator, error) {
-	return queryByIDsMySQLWithSampling(ctx, tx, schema, table, colNames, fkCol, ids, limit, StratifiedSampling{})
+	return queryByIDsMySQLWithSamplingAndCondition(ctx, tx, schema, table, colNames, fkCol, ids, limit, StratifiedSampling{}, "")
 }
 
 // queryByIDsMySQLWithSampling executes batch queries for MySQL with optional stratified child sampling.
@@ -150,6 +188,20 @@ func queryByIDsMySQLWithSampling(
 	ids []string,
 	limit int,
 	sampling StratifiedSampling,
+) (db.RowIterator, error) {
+	return queryByIDsMySQLWithSamplingAndCondition(ctx, tx, schema, table, colNames, fkCol, ids, limit, sampling, "")
+}
+
+func queryByIDsMySQLWithSamplingAndCondition(
+	ctx context.Context,
+	tx db.SourceTx,
+	schema, table string,
+	colNames []string,
+	fkCol string,
+	ids []string,
+	limit int,
+	sampling StratifiedSampling,
+	condition string,
 ) (db.RowIterator, error) {
 	quotedCols := make([]string, len(colNames))
 	for i, c := range colNames {
@@ -170,6 +222,9 @@ func queryByIDsMySQLWithSampling(
 			}
 			args = append(args, seed)
 			q := graph.BuildStratifiedChildQueryMySQL(schema, table, colNames, fkCol, sampling.PKCol, strings.Join(placeholders, ", "), sampling.ChildrenPerParent, limit)
+			if condition != "" {
+				q += fmt.Sprintf(" AND (%s)", condition)
+			}
 			return q, args
 		}
 
@@ -183,6 +238,9 @@ func queryByIDsMySQLWithSampling(
 			db.QuoteIdent(db.EngineMySQL, fkCol),
 			strings.Join(escapedIDs, ", "),
 		)
+		if condition != "" {
+			q += fmt.Sprintf(" AND (%s)", condition)
+		}
 		if limit > 0 {
 			q += fmt.Sprintf(" LIMIT %d", limit)
 		}
@@ -287,11 +345,28 @@ func queryByIDsTempTableWithSampling(
 	limit int,
 	sampling StratifiedSampling,
 ) (db.RowIterator, error) {
+	return queryByIDsTempTableWithSamplingAndCondition(ctx, tx, schema, table, colNames, fkCol, ids, limit, sampling, "")
+}
+
+func queryByIDsTempTableWithSamplingAndCondition(
+	ctx context.Context,
+	tx db.SourceTx,
+	schema, table string,
+	colNames []string,
+	fkCol string,
+	ids []string,
+	limit int,
+	sampling StratifiedSampling,
+	condition string,
+) (db.RowIterator, error) {
 	pgxProvider, ok := tx.(interface{ PGX() pgx.Tx })
 	if !ok {
 		// Fallback to standard ANY query if not direct pgx
 		arrayType := "text"
 		q := buildANYQuery(schema, table, colNames, fkCol, arrayType, limit)
+		if condition != "" {
+			q = graph.BuildANYQueryWithCondition(schema, table, colNames, fkCol, arrayType, limit, condition)
+		}
 		return tx.Query(ctx, q, ids)
 	}
 	pgTx := pgxProvider.PGX()
@@ -339,6 +414,10 @@ func queryByIDsTempTableWithSampling(
 		if limit > 0 {
 			limitClause = fmt.Sprintf(" LIMIT %d", limit)
 		}
+		extraWhere := ""
+		if condition != "" {
+			extraWhere = fmt.Sprintf(" AND (%s)", condition)
+		}
 		q = fmt.Sprintf(`WITH ranked AS (
   SELECT c.*,
          ROW_NUMBER() OVER (
@@ -350,7 +429,7 @@ func queryByIDsTempTableWithSampling(
   INNER JOIN %s k ON k.key = c.%s::text
 )
 SELECT %s FROM ranked
-WHERE rn = 1 OR (rn <= %d AND total_children > 1)%s`,
+WHERE (rn = 1 OR (rn <= %d AND total_children > 1))%s%s`,
 			graph.QuoteIdent(fkCol),
 			pkExpr,
 			graph.QuoteIdent(fkCol),
@@ -360,11 +439,15 @@ WHERE rn = 1 OR (rn <= %d AND total_children > 1)%s`,
 			graph.QuoteIdent(fkCol),
 			strings.Join(quotedCols, ", "),
 			sampling.ChildrenPerParent,
+			extraWhere,
 			limitClause,
 		)
 		args = []any{seed}
 	} else {
 		q = graph.BuildTempTableJoinQuery(schema, table, tmpName, fkCol, colNames, limit)
+		if condition != "" {
+			q += fmt.Sprintf(" AND (%s)", condition)
+		}
 	}
 
 	var it db.RowIterator

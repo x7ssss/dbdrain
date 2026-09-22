@@ -151,11 +151,14 @@ type Summary struct {
 // verifyViolation is a local alias so ui/ does not import verify/ (avoids cycle).
 // Populated by the caller (main.go) by copying verify.Violation fields.
 type verifyViolation struct {
-	ChildTable   string
-	ChildColumn  string
-	ParentTable  string
-	ParentColumn string
-	OrphanCount  int64
+	ChildTable          string
+	ChildColumn         string
+	ParentTable         string
+	ParentColumn        string
+	Status              string
+	OrphanCount         int64
+	PolicyExcludedCount int64
+	RLSActive           bool
 }
 
 // Print renders the summary table to w.
@@ -177,7 +180,7 @@ func (sum *Summary) Print(w io.Writer) {
 	}
 
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, headerStyle.Render("  dbdrain v0.8.0  — slice complete ("+modeLabel+")"))
+	fmt.Fprintln(w, headerStyle.Render("  dbdrain v0.9.0  — slice complete ("+modeLabel+")"))
 	if sum.NumAnchors > 0 || sum.ChildrenPerParent > 0 {
 		fmt.Fprintf(w, "  %s\n", FormatSamplingMetrics(sum.ChildrenPerParent, sum.NumAnchors))
 	}
@@ -218,10 +221,22 @@ func (sum *Summary) Print(w io.Writer) {
 			fmt.Fprintf(w, "  %s\n", okStyle.Render("✔  Integrity verified: 0 orphaned foreign keys across all drained tables."))
 		} else {
 			errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#EF4444")).Bold(true)
+			warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#F59E0B")).Bold(true)
 			fmt.Fprintf(w, "  %s\n", errStyle.Render(fmt.Sprintf("✘  %d FK violation(s) detected:", len(sum.Violations))))
 			for _, v := range sum.Violations {
-				fmt.Fprintf(w, "     • %s.%s → %s.%s : %d orphaned row(s)\n",
-					v.ChildTable, v.ChildColumn, v.ParentTable, v.ParentColumn, v.OrphanCount)
+				status := v.Status
+				if status == "" {
+					status = "Corrupted/Orphan"
+				}
+				if status == "Policy-Excluded" || v.PolicyExcludedCount > 0 {
+					fmt.Fprintf(w, "     • %s.%s → %s.%s : %d row(s) [%s]\n",
+						v.ChildTable, v.ChildColumn, v.ParentTable, v.ParentColumn,
+						v.PolicyExcludedCount, warnStyle.Render("Policy-Excluded"))
+				} else {
+					fmt.Fprintf(w, "     • %s.%s → %s.%s : %d orphaned row(s) [%s]\n",
+						v.ChildTable, v.ChildColumn, v.ParentTable, v.ParentColumn,
+						v.OrphanCount, errStyle.Render(status))
+				}
 			}
 		}
 	}
