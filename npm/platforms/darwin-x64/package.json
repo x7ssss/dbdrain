@@ -1,6 +1,6 @@
 {
   "name": "@x7ssss/dbdrain-darwin-x64",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "dbdrain native binary for macOS Intel (x64)",
   "os": [
     "darwin"

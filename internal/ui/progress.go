@@ -102,11 +102,44 @@ func FormatPausedWarning(reason string) string {
 	)
 }
 
+// FormatSamplingMetrics formats the sampling & multi-anchor status line:
+// ✂ Stratified Sampling: Active (Max 5 children/parent) | Multi-Anchors: 2 roots
+func FormatSamplingMetrics(childrenPerParent int, numAnchors int) string {
+	iconStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#EC4899")).Bold(true)
+	valStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#EC4899")).Bold(true)
+	sep := lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280")).Render(" | ")
+
+	var samplingPart string
+	if childrenPerParent > 0 {
+		samplingPart = fmt.Sprintf("%s Stratified Sampling: %s",
+			iconStyle.Render("✂"),
+			valStyle.Render(fmt.Sprintf("Active (Max %d children/parent)", childrenPerParent)),
+		)
+	} else {
+		samplingPart = fmt.Sprintf("%s Stratified Sampling: %s",
+			iconStyle.Render("✂"),
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280")).Render("Disabled"),
+		)
+	}
+
+	rootsLabel := "root"
+	if numAnchors != 1 {
+		rootsLabel = "roots"
+	}
+	anchorPart := fmt.Sprintf("Multi-Anchors: %s",
+		valStyle.Render(fmt.Sprintf("%d %s", numAnchors, rootsLabel)),
+	)
+
+	return samplingPart + sep + anchorPart
+}
+
 // Summary holds the data for the final result table.
 type Summary struct {
-	Rows      map[string]int
-	Duration  time.Duration
-	HasCycles bool
+	Rows              map[string]int
+	Duration          time.Duration
+	HasCycles         bool
+	ChildrenPerParent int
+	NumAnchors        int
 	// Target is the target DB connection string (non-empty when using --target).
 	Target string
 	// VerifyRan is true when --verify was set.
@@ -144,7 +177,10 @@ func (sum *Summary) Print(w io.Writer) {
 	}
 
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, headerStyle.Render("  dbdrain v0.7.0  — slice complete ("+modeLabel+")"))
+	fmt.Fprintln(w, headerStyle.Render("  dbdrain v0.8.0  — slice complete ("+modeLabel+")"))
+	if sum.NumAnchors > 0 || sum.ChildrenPerParent > 0 {
+		fmt.Fprintf(w, "  %s\n", FormatSamplingMetrics(sum.ChildrenPerParent, sum.NumAnchors))
+	}
 	fmt.Fprintln(w)
 
 	tables := make([]string, 0, len(sum.Rows))

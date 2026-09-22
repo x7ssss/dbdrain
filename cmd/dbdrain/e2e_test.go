@@ -177,7 +177,7 @@ func TestE2E(t *testing.T) {
 
 	// Reset CLI flag variables to avoid interference from any previous runs
 	source = sourceURI
-	fromExpr = "users LIMIT 5"
+	fromExprs = []string{"users LIMIT 5"}
 	output = outputFile
 	schemaName = "public"
 	anonymize = true
@@ -191,6 +191,8 @@ func TestE2E(t *testing.T) {
 	concurrency = 4
 	safeMode = false
 	maxLag = 30 * time.Second
+	childrenPerParent = 0
+	samplingSeed = "dbdrain-sampling"
 
 	rootCmd.SetArgs([]string{
 		"--source", sourceURI,
@@ -419,7 +421,7 @@ func TestE2E(t *testing.T) {
 
 	// Reset CLI flag variables
 	source = sourceURI
-	fromExpr = "users LIMIT 5"
+	fromExprs = []string{"users LIMIT 5"}
 	output = "-"
 	schemaName = "public"
 	anonymize = true
@@ -433,6 +435,8 @@ func TestE2E(t *testing.T) {
 	concurrency = 4
 	safeMode = false
 	maxLag = 30 * time.Second
+	childrenPerParent = 0
+	samplingSeed = "dbdrain-sampling"
 
 	rootCmd.SetArgs([]string{
 		"--source", sourceURI,
@@ -483,7 +487,7 @@ func TestE2E(t *testing.T) {
 	// 4. Test safe-mode with rate limiting, concurrency, and health poller against embedded Postgres
 	safeOutputFile := filepath.Join(t.TempDir(), "safe_slice.sql")
 	source = sourceURI
-	fromExpr = "users LIMIT 3"
+	fromExprs = []string{"users LIMIT 3"}
 	output = safeOutputFile
 	schemaName = "public"
 	anonymize = false
@@ -497,6 +501,8 @@ func TestE2E(t *testing.T) {
 	concurrency = 2
 	safeMode = true
 	maxLag = 10 * time.Second
+	childrenPerParent = 0
+	samplingSeed = "dbdrain-sampling"
 
 	rootCmd.SetArgs([]string{
 		"--source", sourceURI,
@@ -520,4 +526,71 @@ func TestE2E(t *testing.T) {
 		t.Fatalf("expected non-empty output with --safe-mode")
 	}
 	t.Logf("✔ Safe-mode extraction completed successfully with rate-limiting and background health poller")
+
+	// 5. Test multi-anchor extraction with stratified child sampling and direct SQLite hydration
+	multiAnchorSQLiteFile := filepath.Join(t.TempDir(), "multi_anchor.db")
+	source = sourceURI
+	fromExprs = []string{"users WHERE id = 1", "users WHERE id = 2"}
+	output = "-"
+	schemaName = "public"
+	anonymize = false
+	salt = testSalt
+	maxRowsPerTable = 0
+	maxDepth = 0
+	target = multiAnchorSQLiteFile
+	configPath = ""
+	doVerify = true
+	rateLimit = 0
+	concurrency = 4
+	safeMode = false
+	maxLag = 30 * time.Second
+	childrenPerParent = 1
+	samplingSeed = "test-sampling-seed"
+
+	rootCmd.SetArgs([]string{
+		"--source", sourceURI,
+		"--from", "users WHERE id = 1",
+		"--from", "users WHERE id = 2",
+		"--target", multiAnchorSQLiteFile,
+		"--children-per-parent", "1",
+		"--seed", "test-sampling-seed",
+		"--verify",
+	})
+
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("dbdrain multi-anchor with stratified sampling failed: %v", err)
+	}
+
+	mDB, err := sql.Open("sqlite", multiAnchorSQLiteFile)
+	if err != nil {
+		t.Fatalf("open multi-anchor sqlite db: %v", err)
+	}
+	defer mDB.Close()
+
+	var mUserCount, mOrderCount, mItemCount int
+	_ = mDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM "users"`).Scan(&mUserCount)
+	_ = mDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM "orders"`).Scan(&mOrderCount)
+	_ = mDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM "order_items"`).Scan(&mItemCount)
+
+	if mUserCount != 2 {
+		t.Errorf("multi-anchor user count = %d, want 2", mUserCount)
+	}
+	// With childrenPerParent = 1, exactly 1 order per user -> 2 orders total!
+	if mOrderCount != 2 {
+		t.Errorf("stratified child orders count = %d, want 2", mOrderCount)
+	}
+	// With childrenPerParent = 1, exactly 1 item per order -> 2 items total!
+	if mItemCount != 2 {
+		t.Errorf("stratified child items count = %d, want 2", mItemCount)
+	}
+
+	violationsMulti, err := verify.RunSQLite(ctx, mDB)
+	if err != nil {
+		t.Fatalf("verify multi-anchor sqlite failed: %v", err)
+	}
+	if len(violationsMulti) > 0 {
+		t.Errorf("expected 0 FK violations in multi-anchor target, got %d: %+v", len(violationsMulti), violationsMulti)
+	}
+
+	t.Logf("✔ Multi-Anchor DAG Closure & Stratified Child Sampling Verified: %d users, %d orders, %d items. 0 violations.", mUserCount, mOrderCount, mItemCount)
 }

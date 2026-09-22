@@ -26,6 +26,9 @@
 **dbdrain** fills this void: a single Go binary, no runtime dependencies, no Docker, no YAML for basic usage.
 
 - 🪶 **Native SQLite Target Hydration** — Transpile production PostgreSQL and MySQL schemas on-the-fly into SQLite DDL and hydrate local development databases (e.g. `--target ./dev.db`) with `PRAGMA defer_foreign_keys = ON`
+- 🎯 **Multi-Anchor DAG Closures** — Repeatable `--from` flag extracts unified slices across heterogeneous roots with global entity deduplication preventing Cartesian explosion
+- ✂️ **Stratified Child Sampling** — `--children-per-parent N` uniformly samples child entities across parent nodes via SQL window ranking functions while preserving referential integrity
+- ⏩ **Keyset Seek Pagination** — O(1) cursor seek pagination (`WHERE (table, pk) > ($1, $2)`) eliminates `OFFSET` scan degradation during batch traversal
 - ⚡ **Multi-Engine Support** — Native support for PostgreSQL 12+, MySQL 8.0+ / MariaDB 10.5+, and SQLite 3
 - 🔒 **Non-Locking Consistent Snapshots** — Isolation via `REPEATABLE READ READ ONLY` (Postgres) and `START TRANSACTION READ ONLY, WITH CONSISTENT SNAPSHOT` (MySQL)
 - 🔄 **Two-Phase & Deferred Circular FK Resolution** — Resolves cyclic dependencies in MySQL via two-phase inserts/updates, and in SQLite via `PRAGMA defer_foreign_keys = ON`
@@ -129,6 +132,87 @@ Using **Tarjan's Strongly Connected Components (SCC)** algorithm, `dbdrain` dete
    ```sql
    UPDATE `users` SET `team_id` = 1 WHERE `id` = 10;
    ```
+
+---
+
+## Advanced Subsetting Algorithms (v0.8.0)
+
+Version 0.8.0 introduces high-precision graph subsetting algorithms designed for complex schemas with skewed distributions and heterogeneous extraction requirements:
+
+### 1. Multi-Anchor DAG Closure
+Instead of restricting extractions to a single root table, `dbdrain` allows multiple repeatable `--from` flags to extract cohesive slices seeded across different entity domains in a single pass:
+
+```bash
+dbdrain --source "postgres://user:pass@prod-host/mydb" \
+        --from "users WHERE id IN (101, 102) LIMIT 20" \
+        --from "tenants WHERE tier = 'enterprise'" \
+        --target "postgres://user:pass@staging-host/mydb"
+```
+
+- **Unified BFS Queue**: All seed rows across all defined anchors are resolved and enqueued into a unified BFS traversal queue.
+- **Global `(table_name, primary_key)` Deduplication**: Visited row tracking is shared globally across roots. Entities reachable from multiple roots are visited and emitted exactly once, preventing duplicate key violations and eliminating Cartesian explosion.
+
+### 2. Stratified Child Sampling (`--children-per-parent`)
+Blunt table-level limits (`--max-rows-per-table`) suffer from **fan-out skew**: a handful of high-activity parent entities (e.g. power users with 50,000 orders) exhaust the entire row quota, leaving all other parents with 0 child rows.
+
+`--children-per-parent N` enforces a uniform child quota per parent entity down the DAG using database window ranking functions:
+
+```bash
+# Pull enterprise tenants, but limit each tenant to at most 5 users, and each user to at most 3 orders
+dbdrain --source "postgres://user:pass@prod-host/mydb" \
+        --from "tenants WHERE tier = 'enterprise'" \
+        --children-per-parent 5 \
+        --seed "my-deterministic-seed" \
+        --target "./dev.db"
+```
+
+#### Deterministic Window Queries:
+- **PostgreSQL 12+**:
+  ```sql
+  WITH ranked AS (
+    SELECT c.*,
+           ROW_NUMBER() OVER (PARTITION BY c."tenant_id" ORDER BY MD5(CAST(c."id" AS text) || $2)) AS rn,
+           COUNT(*) OVER (PARTITION BY c."tenant_id") AS total_children
+    FROM "public"."users" c
+    WHERE c."tenant_id" = ANY($1::bigint[])
+  )
+  SELECT id, tenant_id, name, email FROM ranked
+  WHERE rn = 1 OR (rn <= 5 AND total_children > 1);
+  ```
+- **MySQL 8.0+ / MariaDB 10.5+**:
+  ```sql
+  WITH ranked AS (
+    SELECT c.*,
+           ROW_NUMBER() OVER (PARTITION BY c.`tenant_id` ORDER BY MD5(CONCAT(CAST(c.`id` AS CHAR), ?))) AS rn,
+           COUNT(*) OVER (PARTITION BY c.`tenant_id`) AS total_children
+    FROM `shop`.`users` c
+    WHERE c.`tenant_id` IN (?, ?, ?)
+  )
+  SELECT id, tenant_id, name, email FROM ranked
+  WHERE rn = 1 OR (rn <= 5 AND total_children > 1);
+  ```
+
+> [!TIP]
+> **Referential Invariant Guarantee**: The window condition `rn = 1 OR (rn <= N AND total_children > 1)` guarantees that every parent with ≥1 child retains at least 1 child, while capping each parent at N children. The pseudo-random hash order `MD5(PK || seed)` ensures reproducible and deterministic subset selection across extraction runs.
+
+### 3. Keyset Seek Pagination for Queues
+Traditional `OFFSET` pagination suffers from $O(N)$ scan degradation as queue depths grow into millions of rows. `dbdrain` v0.8.0 implements composite keyset seek queries:
+
+```sql
+-- PostgreSQL Keyset Seek
+SELECT id, user_id, total FROM "public"."orders"
+WHERE ("user_id", "id") > ($1, $2)
+ORDER BY "user_id", "id" LIMIT 1000;
+```
+
+```sql
+-- MySQL Keyset Seek
+SELECT id, user_id, total FROM `shop`.`orders`
+WHERE (`user_id`, `id`) > (?, ?)
+ORDER BY `user_id`, `id` LIMIT 1000;
+```
+
+This guarantees **$O(1)$ cursor seek time** regardless of whether page 1 or page 50,000 is being traversed.
 
 ---
 
@@ -307,7 +391,9 @@ dbdrain \
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--source` | string | **required** | Source database connection string (`postgres://`, `mysql://`, `mariadb://`) |
-| `--from` | string | **required** | Anchor query: `"<table> [WHERE <clause>] [LIMIT <n>]"` |
+| `--from` | string | **required** | Anchor query (repeatable): `"<table> [WHERE <clause>] [LIMIT <n>]"` |
+| `--children-per-parent` | int | `0` (unlimited) | Quota of child rows pulled per parent entity down the DAG |
+| `--seed` | string | `dbdrain-sampling` | Deterministic hash seed for reproducible stratified child sampling |
 | `--output` | string | `-` (stdout) | Output SQL file path (`-` = stdout) |
 | `--schema` | string | `public` (PG) / DSN db (MySQL) | Schema or database name to operate on |
 | `--anonymize-pii` | bool | `false` | Enable deterministic PII masking |

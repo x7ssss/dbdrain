@@ -26,24 +26,26 @@ import (
 	"github.com/x7ssss/dbdrain/internal/verify"
 )
 
-const version = "v0.7.0"
+const version = "v0.8.0"
 
 var (
-	source          string
-	fromExpr        string
-	output          string
-	schemaName      string
-	anonymize       bool
-	salt            string
-	maxRowsPerTable int
-	maxDepth        int
-	target          string
-	configPath      string
-	doVerify        bool
-	rateLimit       int
-	concurrency     int
-	safeMode        bool
-	maxLag          time.Duration
+	source            string
+	fromExprs         []string
+	output            string
+	schemaName        string
+	anonymize         bool
+	salt              string
+	maxRowsPerTable   int
+	maxDepth          int
+	target            string
+	configPath        string
+	doVerify          bool
+	rateLimit         int
+	concurrency       int
+	safeMode          bool
+	maxLag            time.Duration
+	childrenPerParent int
+	samplingSeed      string
 )
 
 var rootCmd = &cobra.Command{
@@ -54,6 +56,12 @@ PostgreSQL or MySQL/MariaDB database, resolves circular FK dependencies, handles
 associations, deterministically masks PII, and streams slices into PostgreSQL, MySQL, or SQLite.
 
 Examples:
+  # Multi-anchor extraction with stratified sampling into staging database
+  dbdrain --source "postgres://user:pass@localhost/prod" \
+          --from "users WHERE id IN (1,2,3) LIMIT 50" \
+          --from "tenants WHERE tier = 'enterprise'" \
+          --children-per-parent 5 --target "postgres://localhost/staging"
+
   # Stream slice to stdout and pipe directly into psql
   dbdrain --source "postgres://user:pass@localhost/prod" \
           --from "users WHERE id IN (1,2,3) LIMIT 50" | psql postgres://localhost/staging
@@ -77,7 +85,7 @@ Examples:
 
 func init() {
 	rootCmd.Flags().StringVar(&source, "source", "", "Source database connection string (PostgreSQL or MySQL/MariaDB) (required)")
-	rootCmd.Flags().StringVar(&fromExpr, "from", "", `Anchor query, e.g. "users WHERE id IN (1,2,3) LIMIT 50" (required)`)
+	rootCmd.Flags().StringArrayVar(&fromExprs, "from", nil, `Anchor query (repeatable), e.g. "users WHERE id IN (1,2,3) LIMIT 50" (required)`)
 	rootCmd.Flags().StringVar(&output, "output", "-", "Output file path (default: stdout)")
 	rootCmd.Flags().StringVar(&schemaName, "schema", "public", "Target schema/database name")
 	rootCmd.Flags().BoolVar(&anonymize, "anonymize-pii", false, "Enable deterministic PII masking")
@@ -91,6 +99,8 @@ func init() {
 	rootCmd.Flags().IntVar(&concurrency, "concurrency", 4, "Maximum parallel extraction workers")
 	rootCmd.Flags().BoolVar(&safeMode, "safe-mode", false, "Enables active background cluster health polling and automatic adaptive throttling")
 	rootCmd.Flags().DurationVar(&maxLag, "max-lag", 30*time.Second, "Maximum allowed replica lag before pausing extraction")
+	rootCmd.Flags().IntVar(&childrenPerParent, "children-per-parent", 0, "Limit number of child rows pulled per parent entity down the DAG (0 = unlimited)")
+	rootCmd.Flags().StringVar(&samplingSeed, "seed", "dbdrain-sampling", "Deterministic hash seed for stratified child sampling")
 
 	rootCmd.MarkFlagRequired("source")
 	rootCmd.MarkFlagRequired("from")
@@ -133,6 +143,26 @@ func parseFromExpr(expr string) (table string, whereClause string, limit int, er
 	return
 }
 
+// parseFromExprs parses all --from expressions into Anchor definitions.
+func parseFromExprs(exprs []string) ([]drain.Anchor, error) {
+	if len(exprs) == 0 {
+		return nil, fmt.Errorf("at least one --from expression is required")
+	}
+	anchors := make([]drain.Anchor, 0, len(exprs))
+	for _, expr := range exprs {
+		tbl, where, limit, err := parseFromExpr(expr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --from expression %q: %w", expr, err)
+		}
+		anchors = append(anchors, drain.Anchor{
+			Table: tbl,
+			Where: where,
+			Limit: limit,
+		})
+	}
+	return anchors, nil
+}
+
 func runDrain(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 	start := time.Now()
@@ -142,10 +172,16 @@ func runDrain(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--verify requires --target to be set")
 	}
 
-	anchorTable, anchorWhere, anchorLimit, err := parseFromExpr(fromExpr)
+	anchors, err := parseFromExprs(fromExprs)
 	if err != nil {
 		return fmt.Errorf("invalid --from expression: %w", err)
 	}
+
+	anchorNames := make([]string, len(anchors))
+	for i, a := range anchors {
+		anchorNames[i] = a.Table
+	}
+	anchorLabel := strings.Join(anchorNames, ", ")
 
 	// Load declarative config (silently skips if no dbdrain.yaml found).
 	cfg, err := config.Load(configPath)
@@ -293,14 +329,16 @@ func runDrain(cmd *cobra.Command, args []string) error {
 	}
 
 	drainCfg := drain.Config{
-		Schema:          effectiveSchema,
-		AnonymizePII:    anonymize,
-		Salt:            salt,
-		MaxRowsPerTable: maxRowsPerTable,
-		MaxDepth:        maxDepth,
-		Rules:           cfg.Rules,
-		Limiter:         lim,
-		Safety:          poller,
+		Schema:            effectiveSchema,
+		AnonymizePII:      anonymize,
+		Salt:              salt,
+		MaxRowsPerTable:   maxRowsPerTable,
+		MaxDepth:          maxDepth,
+		Rules:             cfg.Rules,
+		Limiter:           lim,
+		Safety:            poller,
+		ChildrenPerParent: childrenPerParent,
+		SamplingSeed:      samplingSeed,
 	}
 
 	exporter := drain.New(sourceDB, schema, g, sccs, drainCfg)
@@ -326,7 +364,7 @@ func runDrain(cmd *cobra.Command, args []string) error {
 			}
 			mu.Unlock()
 			if isTTY && spinner != nil && !safeMode {
-				spinner.UpdateMessage(fmt.Sprintf("Streaming '%s' → target (%d rows)...", anchorTable, total))
+				spinner.UpdateMessage(fmt.Sprintf("Streaming [%s] → target (%d rows)...", anchorLabel, total))
 			}
 		}
 
@@ -356,8 +394,8 @@ func runDrain(cmd *cobra.Command, args []string) error {
 				return fmt.Errorf("create sqlite schema: %w", err)
 			}
 
-			spinnerMsg(fmt.Sprintf("Streaming '%s' → target SQLite...", anchorTable))
-			if err := exporter.ExportToTargetSQLite(ctx, targetDB, anchorTable, anchorWhere, anchorLimit, progressFn); err != nil {
+			spinnerMsg(fmt.Sprintf("Streaming [%s] → target SQLite...", anchorLabel))
+			if err := exporter.ExportAnchorsToTargetSQLite(ctx, targetDB, anchors, progressFn); err != nil {
 				stopSpinner()
 				return fmt.Errorf("stream to target sqlite: %w", err)
 			}
@@ -405,8 +443,8 @@ func runDrain(cmd *cobra.Command, args []string) error {
 				return fmt.Errorf("ping target mysql: %w", err)
 			}
 
-			spinnerMsg(fmt.Sprintf("Streaming '%s' → target MySQL...", anchorTable))
-			if err := exporter.ExportToTargetMySQL(ctx, targetDB, targetSchema, anchorTable, anchorWhere, anchorLimit, progressFn); err != nil {
+			spinnerMsg(fmt.Sprintf("Streaming [%s] → target MySQL...", anchorLabel))
+			if err := exporter.ExportAnchorsToTargetMySQL(ctx, targetDB, targetSchema, anchors, progressFn); err != nil {
 				stopSpinner()
 				return fmt.Errorf("stream to target mysql: %w", err)
 			}
@@ -439,8 +477,8 @@ func runDrain(cmd *cobra.Command, args []string) error {
 			}
 			defer targetConn.Close(ctx)
 
-			spinnerMsg(fmt.Sprintf("Streaming '%s' → target...", anchorTable))
-			if err := exporter.ExportToTarget(ctx, targetConn, anchorTable, anchorWhere, anchorLimit, progressFn); err != nil {
+			spinnerMsg(fmt.Sprintf("Streaming [%s] → target...", anchorLabel))
+			if err := exporter.ExportAnchorsToTarget(ctx, targetConn, anchors, progressFn); err != nil {
 				stopSpinner()
 				return fmt.Errorf("stream to target: %w", err)
 			}
@@ -476,12 +514,14 @@ func runDrain(cmd *cobra.Command, args []string) error {
 				}
 			}
 			sum := &ui.Summary{
-				Rows:       exporter.RowCounts,
-				Duration:   time.Since(start),
-				HasCycles:  hasCycles,
-				Target:     target,
-				Violations: uiViolations,
-				VerifyRan:  doVerify,
+				Rows:              exporter.RowCounts,
+				Duration:          time.Since(start),
+				HasCycles:         hasCycles,
+				ChildrenPerParent: childrenPerParent,
+				NumAnchors:        len(anchors),
+				Target:            target,
+				Violations:        uiViolations,
+				VerifyRan:         doVerify,
 			}
 			sum.Print(os.Stderr)
 		} else if doVerify && len(uiViolations) > 0 {
@@ -509,9 +549,9 @@ func runDrain(cmd *cobra.Command, args []string) error {
 		w = f
 	}
 
-	spinnerMsg(fmt.Sprintf("Exporting slice from '%s'...", anchorTable))
+	spinnerMsg(fmt.Sprintf("Exporting slice from [%s]...", anchorLabel))
 
-	if err := exporter.Export(ctx, w, anchorTable, anchorWhere, anchorLimit); err != nil {
+	if err := exporter.ExportAnchors(ctx, w, anchors); err != nil {
 		stopSpinner()
 		return fmt.Errorf("export: %w", err)
 	}
@@ -527,9 +567,11 @@ func runDrain(cmd *cobra.Command, args []string) error {
 			}
 		}
 		sum := &ui.Summary{
-			Rows:      exporter.RowCounts,
-			Duration:  time.Since(start),
-			HasCycles: hasCycles,
+			Rows:              exporter.RowCounts,
+			Duration:          time.Since(start),
+			HasCycles:         hasCycles,
+			ChildrenPerParent: childrenPerParent,
+			NumAnchors:        len(anchors),
 		}
 		sum.Print(os.Stderr)
 	}

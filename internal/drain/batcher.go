@@ -44,6 +44,13 @@ func findColumnByName(cols []introspect.Column, name string) *introspect.Column 
 	return nil
 }
 
+// StratifiedSampling configures proportional child sampling per parent entity.
+type StratifiedSampling struct {
+	ChildrenPerParent int
+	Seed              string
+	PKCol             string
+}
+
 // queryByIDs selects rows from schema.table where fkCol is in ids, routing according to engine.
 // Routing logic:
 //   - 0 IDs           → returns nil, nil (no-op)
@@ -61,17 +68,33 @@ func queryByIDs(
 	ids []string,
 	limit int,
 ) (db.RowIterator, error) {
+	return queryByIDsWithSampling(ctx, tx, engine, schema, table, colNames, fkCol, fkColInfo, ids, limit, StratifiedSampling{})
+}
+
+// queryByIDsWithSampling executes batch queries with optional stratified child sampling using window ranking.
+func queryByIDsWithSampling(
+	ctx context.Context,
+	tx db.SourceTx,
+	engine db.EngineType,
+	schema, table string,
+	colNames []string,
+	fkCol string,
+	fkColInfo *introspect.Column,
+	ids []string,
+	limit int,
+	sampling StratifiedSampling,
+) (db.RowIterator, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
 
 	if engine == db.EngineMySQL {
-		return queryByIDsMySQL(ctx, tx, schema, table, colNames, fkCol, ids, limit)
+		return queryByIDsMySQLWithSampling(ctx, tx, schema, table, colNames, fkCol, ids, limit, sampling)
 	}
 
 	// Postgres path
 	if len(ids) > anyArrayThreshold {
-		return queryByIDsTempTable(ctx, tx, schema, table, colNames, fkCol, ids, limit)
+		return queryByIDsTempTableWithSampling(ctx, tx, schema, table, colNames, fkCol, ids, limit, sampling)
 	}
 
 	arrayType := "text"
@@ -79,12 +102,26 @@ func queryByIDs(
 		arrayType = pgArrayType(*fkColInfo)
 	}
 
-	q := buildANYQuery(schema, table, colNames, fkCol, arrayType, limit)
+	var q string
+	var args []any
 	param := idsToANYParam(ids, arrayType)
+
+	if sampling.ChildrenPerParent > 0 {
+		seed := sampling.Seed
+		if seed == "" {
+			seed = "dbdrain-sampling"
+		}
+		q = graph.BuildStratifiedChildQuery(schema, table, colNames, fkCol, sampling.PKCol, arrayType, sampling.ChildrenPerParent, limit)
+		args = []any{param, seed}
+	} else {
+		q = buildANYQuery(schema, table, colNames, fkCol, arrayType, limit)
+		args = []any{param}
+	}
+
 	var it db.RowIterator
 	err := safety.ExecuteWithBackoffJitter(ctx, 3, 50*time.Millisecond, func() error {
 		var qErr error
-		it, qErr = tx.Query(ctx, q, param)
+		it, qErr = tx.Query(ctx, q, args...)
 		return qErr
 	})
 	return it, err
@@ -100,12 +137,42 @@ func queryByIDsMySQL(
 	ids []string,
 	limit int,
 ) (db.RowIterator, error) {
+	return queryByIDsMySQLWithSampling(ctx, tx, schema, table, colNames, fkCol, ids, limit, StratifiedSampling{})
+}
+
+// queryByIDsMySQLWithSampling executes batch queries for MySQL with optional stratified child sampling.
+func queryByIDsMySQLWithSampling(
+	ctx context.Context,
+	tx db.SourceTx,
+	schema, table string,
+	colNames []string,
+	fkCol string,
+	ids []string,
+	limit int,
+	sampling StratifiedSampling,
+) (db.RowIterator, error) {
 	quotedCols := make([]string, len(colNames))
 	for i, c := range colNames {
 		quotedCols[i] = db.QuoteIdent(db.EngineMySQL, c)
 	}
 
-	buildChunkQuery := func(chunk []string) string {
+	buildChunkQuery := func(chunk []string) (string, []any) {
+		if sampling.ChildrenPerParent > 0 {
+			placeholders := make([]string, len(chunk))
+			args := make([]any, 0, len(chunk)+1)
+			for i, id := range chunk {
+				placeholders[i] = "?"
+				args = append(args, id)
+			}
+			seed := sampling.Seed
+			if seed == "" {
+				seed = "dbdrain-sampling"
+			}
+			args = append(args, seed)
+			q := graph.BuildStratifiedChildQueryMySQL(schema, table, colNames, fkCol, sampling.PKCol, strings.Join(placeholders, ", "), sampling.ChildrenPerParent, limit)
+			return q, args
+		}
+
 		escapedIDs := make([]string, len(chunk))
 		for i, id := range chunk {
 			escapedIDs[i] = "'" + escapeMySQLString(id) + "'"
@@ -119,14 +186,15 @@ func queryByIDsMySQL(
 		if limit > 0 {
 			q += fmt.Sprintf(" LIMIT %d", limit)
 		}
-		return q
+		return q, nil
 	}
 
 	if len(ids) <= mysqlChunkSize {
+		chunkSQL, args := buildChunkQuery(ids)
 		var it db.RowIterator
 		err := safety.ExecuteWithBackoffJitter(ctx, 3, 50*time.Millisecond, func() error {
 			var qErr error
-			it, qErr = tx.Query(ctx, buildChunkQuery(ids))
+			it, qErr = tx.Query(ctx, chunkSQL, args...)
 			return qErr
 		})
 		return it, err
@@ -139,10 +207,10 @@ func queryByIDsMySQL(
 			end = len(ids)
 		}
 		var it db.RowIterator
-		chunkSQL := buildChunkQuery(ids[i:end])
+		chunkSQL, args := buildChunkQuery(ids[i:end])
 		err := safety.ExecuteWithBackoffJitter(ctx, 3, 50*time.Millisecond, func() error {
 			var qErr error
-			it, qErr = tx.Query(ctx, chunkSQL)
+			it, qErr = tx.Query(ctx, chunkSQL, args...)
 			return qErr
 		})
 		if err != nil {
@@ -205,6 +273,20 @@ func queryByIDsTempTable(
 	ids []string,
 	limit int,
 ) (db.RowIterator, error) {
+	return queryByIDsTempTableWithSampling(ctx, tx, schema, table, colNames, fkCol, ids, limit, StratifiedSampling{})
+}
+
+// queryByIDsTempTableWithSampling handles >10,000 IDs for Postgres with optional stratified child sampling.
+func queryByIDsTempTableWithSampling(
+	ctx context.Context,
+	tx db.SourceTx,
+	schema, table string,
+	colNames []string,
+	fkCol string,
+	ids []string,
+	limit int,
+	sampling StratifiedSampling,
+) (db.RowIterator, error) {
 	pgxProvider, ok := tx.(interface{ PGX() pgx.Tx })
 	if !ok {
 		// Fallback to standard ANY query if not direct pgx
@@ -238,11 +320,57 @@ func queryByIDsTempTable(
 		return nil, fmt.Errorf("copy ids into temp table %s: %w", tmpName, err)
 	}
 
-	q := graph.BuildTempTableJoinQuery(schema, table, tmpName, fkCol, colNames, limit)
+	var q string
+	var args []any
+	if sampling.ChildrenPerParent > 0 {
+		seed := sampling.Seed
+		if seed == "" {
+			seed = "dbdrain-sampling"
+		}
+		quotedCols := make([]string, len(colNames))
+		for i, c := range colNames {
+			quotedCols[i] = graph.QuoteIdent(c)
+		}
+		pkExpr := graph.QuoteIdent(sampling.PKCol)
+		if sampling.PKCol == "" {
+			pkExpr = graph.QuoteIdent(fkCol)
+		}
+		limitClause := ""
+		if limit > 0 {
+			limitClause = fmt.Sprintf(" LIMIT %d", limit)
+		}
+		q = fmt.Sprintf(`WITH ranked AS (
+  SELECT c.*,
+         ROW_NUMBER() OVER (
+           PARTITION BY c.%s
+           ORDER BY MD5(CAST(c.%s AS text) || $1)
+         ) AS rn,
+         COUNT(*) OVER (PARTITION BY c.%s) AS total_children
+  FROM %s.%s c
+  INNER JOIN %s k ON k.key = c.%s::text
+)
+SELECT %s FROM ranked
+WHERE rn = 1 OR (rn <= %d AND total_children > 1)%s`,
+			graph.QuoteIdent(fkCol),
+			pkExpr,
+			graph.QuoteIdent(fkCol),
+			graph.QuoteIdent(schema),
+			graph.QuoteIdent(table),
+			graph.QuoteIdent(tmpName),
+			graph.QuoteIdent(fkCol),
+			strings.Join(quotedCols, ", "),
+			sampling.ChildrenPerParent,
+			limitClause,
+		)
+		args = []any{seed}
+	} else {
+		q = graph.BuildTempTableJoinQuery(schema, table, tmpName, fkCol, colNames, limit)
+	}
+
 	var it db.RowIterator
 	err := safety.ExecuteWithBackoffJitter(ctx, 3, 50*time.Millisecond, func() error {
 		var qErr error
-		it, qErr = tx.Query(ctx, q)
+		it, qErr = tx.Query(ctx, q, args...)
 		return qErr
 	})
 	return it, err
