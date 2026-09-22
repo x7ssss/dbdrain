@@ -219,6 +219,25 @@ func (p *PostgresSource) BeginSnapshot(ctx context.Context) (SourceTx, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Fail-fast session timeouts and safety guards
+	guards := []string{
+		"SET LOCAL statement_timeout = '30s'",
+		"SET LOCAL lock_timeout = '100ms'",
+		"SET LOCAL idle_in_transaction_session_timeout = '60s'",
+		"SET LOCAL application_name = 'dbdrain-worker'",
+	}
+	for _, g := range guards {
+		if _, err := tx.Exec(ctx, g); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "unrecognized configuration parameter") &&
+				strings.Contains(g, "idle_in_transaction_session_timeout") {
+				continue
+			}
+			_ = tx.Rollback(ctx)
+			return nil, fmt.Errorf("execute session safety guard %q: %w", g, err)
+		}
+	}
+
 	return &postgresSourceTx{tx: tx}, nil
 }
 

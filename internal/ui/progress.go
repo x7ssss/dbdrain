@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/dustin/go-humanize"
 	"golang.org/x/term"
 )
 
@@ -73,6 +74,34 @@ func (s *Spinner) Stop() {
 	<-s.done
 }
 
+// FormatHealthTelemetry renders live health telemetry:
+// ⚡ Engine: Healthy | History List: 1,420 | Rate: 4,500 rows/s | Workers: 4
+func FormatHealthTelemetry(engineState string, historyList int64, rate int64, workers int) string {
+	iconStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#10B981")).Bold(true)
+	valStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#10B981")).Bold(true)
+	sep := lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280")).Render(" | ")
+
+	enginePart := fmt.Sprintf("%s Engine: %s", iconStyle.Render("⚡"), valStyle.Render(engineState))
+	hllPart := fmt.Sprintf("History List: %s", valStyle.Render(humanize.Comma(historyList)))
+	ratePart := fmt.Sprintf("Rate: %s rows/s", valStyle.Render(humanize.Comma(rate)))
+	workersPart := fmt.Sprintf("Workers: %s", valStyle.Render(fmt.Sprintf("%d", workers)))
+
+	return enginePart + sep + hllPart + sep + ratePart + sep + workersPart
+}
+
+// FormatPausedWarning renders warning message when paused due to cluster backpressure:
+// ⚠ Paused: Target cluster under high load (history list > 100k). Waiting for recovery...
+func FormatPausedWarning(reason string) string {
+	warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#F59E0B")).Bold(true)
+	if reason == "" {
+		reason = "history list > 100k"
+	}
+	return fmt.Sprintf("%s Target cluster under high load (%s). Waiting for recovery...",
+		warnStyle.Render("⚠ Paused:"),
+		reason,
+	)
+}
+
 // Summary holds the data for the final result table.
 type Summary struct {
 	Rows      map[string]int
@@ -115,7 +144,7 @@ func (sum *Summary) Print(w io.Writer) {
 	}
 
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, headerStyle.Render("  dbdrain v0.4.0  — slice complete ("+modeLabel+")"))
+	fmt.Fprintln(w, headerStyle.Render("  dbdrain v0.7.0  — slice complete ("+modeLabel+")"))
 	fmt.Fprintln(w)
 
 	tables := make([]string, 0, len(sum.Rows))

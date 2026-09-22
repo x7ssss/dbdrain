@@ -187,6 +187,10 @@ func TestE2E(t *testing.T) {
 	target = ""
 	configPath = ""
 	doVerify = false
+	rateLimit = 0
+	concurrency = 4
+	safeMode = false
+	maxLag = 30 * time.Second
 
 	rootCmd.SetArgs([]string{
 		"--source", sourceURI,
@@ -425,6 +429,10 @@ func TestE2E(t *testing.T) {
 	target = sqliteFile
 	configPath = ""
 	doVerify = true
+	rateLimit = 0
+	concurrency = 4
+	safeMode = false
+	maxLag = 30 * time.Second
 
 	rootCmd.SetArgs([]string{
 		"--source", sourceURI,
@@ -471,4 +479,45 @@ func TestE2E(t *testing.T) {
 	}
 
 	t.Logf("✔ Direct SQLite Hydration & Foreign Key Check Verified: %d users, %d orders, %d items. 0 violations.", sUserCount, sOrderCount, sItemCount)
+
+	// 4. Test safe-mode with rate limiting, concurrency, and health poller against embedded Postgres
+	safeOutputFile := filepath.Join(t.TempDir(), "safe_slice.sql")
+	source = sourceURI
+	fromExpr = "users LIMIT 3"
+	output = safeOutputFile
+	schemaName = "public"
+	anonymize = false
+	salt = testSalt
+	maxRowsPerTable = 0
+	maxDepth = 0
+	target = ""
+	configPath = ""
+	doVerify = false
+	rateLimit = 500
+	concurrency = 2
+	safeMode = true
+	maxLag = 10 * time.Second
+
+	rootCmd.SetArgs([]string{
+		"--source", sourceURI,
+		"--from", "users LIMIT 3",
+		"--output", safeOutputFile,
+		"--safe-mode",
+		"--rate-limit", "500",
+		"--concurrency", "2",
+		"--max-lag", "10s",
+	})
+
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("dbdrain CLI with --safe-mode failed: %v", err)
+	}
+
+	safeContent, err := os.ReadFile(safeOutputFile)
+	if err != nil {
+		t.Fatalf("read safe output file: %v", err)
+	}
+	if len(safeContent) == 0 {
+		t.Fatalf("expected non-empty output with --safe-mode")
+	}
+	t.Logf("✔ Safe-mode extraction completed successfully with rate-limiting and background health poller")
 }

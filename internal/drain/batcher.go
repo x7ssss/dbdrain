@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/x7ssss/dbdrain/internal/db"
 	"github.com/x7ssss/dbdrain/internal/graph"
 	"github.com/x7ssss/dbdrain/internal/introspect"
+	"github.com/x7ssss/dbdrain/internal/safety"
 )
 
 // anyArrayThreshold is the threshold up to which = ANY($1::type[]) parameterized arrays are used.
@@ -79,7 +81,13 @@ func queryByIDs(
 
 	q := buildANYQuery(schema, table, colNames, fkCol, arrayType, limit)
 	param := idsToANYParam(ids, arrayType)
-	return tx.Query(ctx, q, param)
+	var it db.RowIterator
+	err := safety.ExecuteWithBackoffJitter(ctx, 3, 50*time.Millisecond, func() error {
+		var qErr error
+		it, qErr = tx.Query(ctx, q, param)
+		return qErr
+	})
+	return it, err
 }
 
 // queryByIDsMySQL executes batch queries for MySQL using IN (...) clauses, chunking if necessary.
@@ -115,7 +123,13 @@ func queryByIDsMySQL(
 	}
 
 	if len(ids) <= mysqlChunkSize {
-		return tx.Query(ctx, buildChunkQuery(ids))
+		var it db.RowIterator
+		err := safety.ExecuteWithBackoffJitter(ctx, 3, 50*time.Millisecond, func() error {
+			var qErr error
+			it, qErr = tx.Query(ctx, buildChunkQuery(ids))
+			return qErr
+		})
+		return it, err
 	}
 
 	var iterators []db.RowIterator
@@ -124,7 +138,13 @@ func queryByIDsMySQL(
 		if end > len(ids) {
 			end = len(ids)
 		}
-		it, err := tx.Query(ctx, buildChunkQuery(ids[i:end]))
+		var it db.RowIterator
+		chunkSQL := buildChunkQuery(ids[i:end])
+		err := safety.ExecuteWithBackoffJitter(ctx, 3, 50*time.Millisecond, func() error {
+			var qErr error
+			it, qErr = tx.Query(ctx, chunkSQL)
+			return qErr
+		})
 		if err != nil {
 			for _, prev := range iterators {
 				prev.Close()
@@ -219,7 +239,13 @@ func queryByIDsTempTable(
 	}
 
 	q := graph.BuildTempTableJoinQuery(schema, table, tmpName, fkCol, colNames, limit)
-	return tx.Query(ctx, q)
+	var it db.RowIterator
+	err := safety.ExecuteWithBackoffJitter(ctx, 3, 50*time.Millisecond, func() error {
+		var qErr error
+		it, qErr = tx.Query(ctx, q)
+		return qErr
+	})
+	return it, err
 }
 
 // sanitizeIdent converts an arbitrary string to a safe SQL identifier suffix.

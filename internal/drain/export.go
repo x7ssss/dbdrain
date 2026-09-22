@@ -14,16 +14,27 @@ import (
 	"github.com/x7ssss/dbdrain/internal/db"
 	"github.com/x7ssss/dbdrain/internal/graph"
 	"github.com/x7ssss/dbdrain/internal/introspect"
+	"github.com/x7ssss/dbdrain/internal/throttle"
 )
+
+// SafetyController abstracts background health monitoring and adaptive backpressure.
+type SafetyController interface {
+	WaitIfPaused(ctx context.Context) error
+	IsPaused() bool
+	EngineState() string
+	PauseReason() string
+}
 
 // Config holds export configuration.
 type Config struct {
 	Schema          string
 	AnonymizePII    bool
 	Salt            string
-	MaxRowsPerTable int // 0 = unlimited
-	MaxDepth        int // 0 = unlimited (downward traversal only)
+	MaxRowsPerTable int           // 0 = unlimited
+	MaxDepth        int           // 0 = unlimited (downward traversal only)
 	Rules           []config.Rule // declarative masking rules from dbdrain.yaml
+	Limiter         *throttle.Limiter
+	Safety          SafetyController
 }
 
 // polyPair holds a (discriminatorValue, fkValue) pair captured during row emission.
@@ -97,6 +108,67 @@ func (e *Exporter) hasCycles() bool {
 		}
 	}
 	return false
+}
+
+// BeforeChunk acquires worker concurrency and rate limiter tokens,
+// and enforces that if the cluster is paused, any open transaction is finished/rolled back
+// before sleeping, satisfying the critical production safety rule.
+func (e *Exporter) BeforeChunk(ctx context.Context, txPtr *db.SourceTx, count int) error {
+	if e.cfg.Limiter != nil {
+		if err := e.cfg.Limiter.AcquireWorker(ctx); err != nil {
+			return err
+		}
+		if err := e.cfg.Limiter.Acquire(ctx, count); err != nil {
+			e.cfg.Limiter.ReleaseWorker()
+			return err
+		}
+	}
+
+	if e.cfg.Safety != nil && e.cfg.Safety.IsPaused() {
+		// CRITICAL RULE: When paused, the extractor must finish or roll back the current bounded chunk;
+		// never sleep while holding an open consistent-read transaction.
+		if txPtr != nil && *txPtr != nil {
+			_ = (*txPtr).Rollback(ctx)
+			*txPtr = nil
+		}
+		if err := e.cfg.Safety.WaitIfPaused(ctx); err != nil {
+			if e.cfg.Limiter != nil {
+				e.cfg.Limiter.ReleaseWorker()
+			}
+			return err
+		}
+	}
+
+	if txPtr != nil && *txPtr == nil && e.sourceDB != nil {
+		newTx, err := e.sourceDB.BeginSnapshot(ctx)
+		if err != nil {
+			if e.cfg.Limiter != nil {
+				e.cfg.Limiter.ReleaseWorker()
+			}
+			return err
+		}
+		*txPtr = newTx
+	}
+
+	return nil
+}
+
+// AfterChunk releases worker concurrency, records extracted rows,
+// and if cluster health is paused, immediately rolls back the open transaction
+// to avoid sleeping while holding an open snapshot.
+func (e *Exporter) AfterChunk(ctx context.Context, txPtr *db.SourceTx, rowsCount int) {
+	if e.cfg.Limiter != nil {
+		e.cfg.Limiter.RecordRows(rowsCount)
+		e.cfg.Limiter.ReleaseWorker()
+	}
+
+	if e.cfg.Safety != nil && e.cfg.Safety.IsPaused() {
+		// CRITICAL RULE: Finish or roll back chunk; never sleep holding open transaction.
+		if txPtr != nil && *txPtr != nil {
+			_ = (*txPtr).Rollback(ctx)
+			*txPtr = nil
+		}
+	}
 }
 
 // -------------------------------------------------------------------------

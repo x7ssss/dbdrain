@@ -132,6 +132,55 @@ Using **Tarjan's Strongly Connected Components (SCC)** algorithm, `dbdrain` dete
 
 ---
 
+## Production Safety Controls & Adaptive Pacing (v0.7.0)
+
+Extracting large data slices from live production primary or replica databases requires strict safety guarantees to prevent locking queries, catalog contention, or overwhelming database purge mechanisms. `dbdrain` v0.7.0 introduces an enterprise-grade safety architecture:
+
+### 1. Fail-Fast Session Timeouts
+For PostgreSQL sources, dedicated extraction connections automatically execute strict transaction-level session guards:
+```sql
+SET LOCAL statement_timeout = '30s';
+SET LOCAL lock_timeout = '100ms';
+SET LOCAL idle_in_transaction_session_timeout = '60s';
+SET LOCAL application_name = 'dbdrain-worker';
+```
+- **Lock Timeout Guarding**: With `lock_timeout = '100ms'`, if concurrent DDL migrations (e.g. `ALTER TABLE`) are running, `dbdrain` fails fast with jittered exponential backoff rather than queuing behind locks and blocking production transactions.
+- **Identifiable DBA Telemetry**: The dedicated `application_name = 'dbdrain-worker'` tag allows database administrators to clearly monitor and identify extractor queries in `pg_stat_activity`.
+
+### 2. Autonomous Cluster Health Poller (`--safe-mode`)
+When `--safe-mode` is enabled, an independent background monitor continuously inspects cluster load every 5 seconds via short, dedicated autocommit connections:
+- **MySQL InnoDB Health**:
+  - Monitors `trx_rseg_history_len` (InnoDB History List Length) via `information_schema.INNODB_METRICS` (or `SHOW ENGINE INNODB STATUS`).
+  - Monitors replication lag (`Seconds_Behind_Source`) via `SHOW REPLICA STATUS`.
+  - **Thresholds**:
+    - History List Length > 100,000: Triggers adaptive backoff pacing.
+    - History List Length > 1,000,000 or Replication Lag > `--max-lag`: Pauses new chunk extraction immediately until the cluster recovers.
+- **PostgreSQL Health**:
+  - Monitors active sessions, IO waiters, lock waiters, and oldest active transaction age (`now() - xact_start`) via `pg_stat_activity`, and replication slot lag via `pg_replication_slots`.
+  - **Thresholds**:
+    - Oldest transaction age > `--max-lag` or lock waiters spike (≥ 5): Pauses extraction immediately.
+    - Elevated IO waiters (≥ 10) or tx age: Triggers adaptive backoff pacing.
+
+> [!IMPORTANT]
+> **Zero-Leak Snapshot Invariant**: When paused due to cluster backpressure, the extractor finishes or rolls back the current bounded chunk before pausing. It **never sleeps while holding an open consistent-read transaction**, preventing undo log bloat and allowing vacuum and purge threads to clear dead tuples freely.
+
+### 3. Token-Bucket Rate Limiter & Concurrency Controller
+Fine-tune throughput and resource usage during extractions:
+- `--rate-limit <rows/sec>`: Implements a token-bucket rate limiter via `golang.org/x/time/rate` to bound row extraction rates and prevent network saturation.
+- `--concurrency <workers>`: Limits parallel extraction workers using semaphore channels (default: 4).
+
+### 4. Lipgloss Live Health Telemetry
+When running interactively in terminal mode with `--safe-mode`, `dbdrain` displays real-time cluster health and extraction speed:
+```text
+⚡ Engine: Healthy | History List: 1,420 | Rate: 4,500 rows/s | Workers: 4
+```
+If backpressure thresholds are breached, the status monitor alerts the user and gracefully awaits cluster recovery:
+```text
+⚠ Paused: Target cluster under high load (history list > 100k). Waiting for recovery...
+```
+
+---
+
 ## Quick Start
 
 ### Run with npx (Node.js)
@@ -268,6 +317,10 @@ dbdrain \
 | `--target` | string | — | Target DB string or file (PostgreSQL, MySQL, or SQLite `.db` file) |
 | `--config` | string | `dbdrain.yaml` (auto) | Path to declarative config file |
 | `--verify` | bool | `false` | Run post-hydration orphan integrity checks (requires `--target`) |
+| `--rate-limit` | int | `0` (unlimited) | Rate limit in rows per second |
+| `--concurrency` | int | `4` | Maximum parallel extraction workers |
+| `--safe-mode` | bool | `false` | Enables active background cluster health polling and automatic adaptive throttling |
+| `--max-lag` | duration | `30s` | Maximum allowed replica lag before pausing extraction |
 
 ---
 

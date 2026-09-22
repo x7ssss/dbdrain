@@ -1,6 +1,6 @@
 {
   "name": "@x7ssss/dbdrain-darwin-arm64",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "dbdrain native binary for macOS Apple Silicon (arm64)",
   "os": [
     "darwin"

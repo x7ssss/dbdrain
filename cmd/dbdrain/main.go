@@ -19,12 +19,14 @@ import (
 	"github.com/x7ssss/dbdrain/internal/drain"
 	"github.com/x7ssss/dbdrain/internal/graph"
 	"github.com/x7ssss/dbdrain/internal/introspect"
+	"github.com/x7ssss/dbdrain/internal/safety"
+	"github.com/x7ssss/dbdrain/internal/throttle"
 	"github.com/x7ssss/dbdrain/internal/transpile"
 	"github.com/x7ssss/dbdrain/internal/ui"
 	"github.com/x7ssss/dbdrain/internal/verify"
 )
 
-const version = "v0.6.0"
+const version = "v0.7.0"
 
 var (
 	source          string
@@ -38,6 +40,10 @@ var (
 	target          string
 	configPath      string
 	doVerify        bool
+	rateLimit       int
+	concurrency     int
+	safeMode        bool
+	maxLag          time.Duration
 )
 
 var rootCmd = &cobra.Command{
@@ -81,6 +87,10 @@ func init() {
 	rootCmd.Flags().StringVar(&target, "target", "", "Target database connection string or file (PostgreSQL, MySQL/MariaDB, or SQLite .db file) (bypasses --output)")
 	rootCmd.Flags().StringVar(&configPath, "config", "", "Path to dbdrain.yaml config file (auto-detected if omitted)")
 	rootCmd.Flags().BoolVar(&doVerify, "verify", false, "Run post-hydration orphan integrity checks on --target (requires --target)")
+	rootCmd.Flags().IntVar(&rateLimit, "rate-limit", 0, "Rate limit in rows per second (0 = unlimited)")
+	rootCmd.Flags().IntVar(&concurrency, "concurrency", 4, "Maximum parallel extraction workers")
+	rootCmd.Flags().BoolVar(&safeMode, "safe-mode", false, "Enables active background cluster health polling and automatic adaptive throttling")
+	rootCmd.Flags().DurationVar(&maxLag, "max-lag", 30*time.Second, "Maximum allowed replica lag before pausing extraction")
 
 	rootCmd.MarkFlagRequired("source")
 	rootCmd.MarkFlagRequired("from")
@@ -234,6 +244,54 @@ func runDrain(cmd *cobra.Command, args []string) error {
 	g := graph.New(schema, vfkInputs)
 	sccs := graph.TarjanSCC(g)
 
+	lim := throttle.New(rateLimit, concurrency)
+
+	var poller *safety.HealthPoller
+	if safeMode {
+		thresholds := safety.DefaultThresholds(maxLag)
+		poller = safety.NewHealthPoller(source, sourceEngine, thresholds)
+		poller.Start(ctx)
+		defer poller.Stop()
+	}
+
+	stopTelemetry := make(chan struct{})
+	var telemetryOnce sync.Once
+	stopTelemetryFunc := func() {
+		telemetryOnce.Do(func() {
+			close(stopTelemetry)
+		})
+	}
+	defer stopTelemetryFunc()
+
+	if isTTY && safeMode && poller != nil {
+		go func() {
+			ticker := time.NewTicker(150 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopTelemetry:
+					return
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if spinner == nil {
+						continue
+					}
+					if poller.IsPaused() {
+						spinner.UpdateMessage(ui.FormatPausedWarning(poller.PauseReason()))
+					} else {
+						spinner.UpdateMessage(ui.FormatHealthTelemetry(
+							poller.EngineState(),
+							poller.HistoryListLength(),
+							lim.CurrentRate(),
+							lim.Concurrency(),
+						))
+					}
+				}
+			}
+		}()
+	}
+
 	drainCfg := drain.Config{
 		Schema:          effectiveSchema,
 		AnonymizePII:    anonymize,
@@ -241,6 +299,8 @@ func runDrain(cmd *cobra.Command, args []string) error {
 		MaxRowsPerTable: maxRowsPerTable,
 		MaxDepth:        maxDepth,
 		Rules:           cfg.Rules,
+		Limiter:         lim,
+		Safety:          poller,
 	}
 
 	exporter := drain.New(sourceDB, schema, g, sccs, drainCfg)
@@ -257,6 +317,7 @@ func runDrain(cmd *cobra.Command, args []string) error {
 		rowsStreamed := make(map[string]int)
 
 		progressFn := func(tbl string, n int) {
+			lim.RecordRows(n)
 			mu.Lock()
 			rowsStreamed[tbl] += n
 			total := 0
@@ -264,7 +325,7 @@ func runDrain(cmd *cobra.Command, args []string) error {
 				total += v
 			}
 			mu.Unlock()
-			if isTTY && spinner != nil {
+			if isTTY && spinner != nil && !safeMode {
 				spinner.UpdateMessage(fmt.Sprintf("Streaming '%s' → target (%d rows)...", anchorTable, total))
 			}
 		}
