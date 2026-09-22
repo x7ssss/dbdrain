@@ -28,6 +28,7 @@
 - 🪶 **Native SQLite Target Hydration** — Transpile production PostgreSQL and MySQL schemas on-the-fly into SQLite DDL and hydrate local development databases (e.g. `--target ./dev.db`) with `PRAGMA defer_foreign_keys = ON`
 - 🎯 **Multi-Anchor DAG Closures** — Repeatable `--from` flag extracts unified slices across heterogeneous roots with global entity deduplication preventing Cartesian explosion
 - 🌲 **Reverse Subsetting & Upstream Ancestry Pruning** — `--upstream` treats anchor as an isolated leaf incident, computing strict upward-only recursive DAG closure while pruning all sibling and downstream branches
+- 🌐 **Citus Distributed Table Awareness** — Discovers coordinator distribution metadata (`citus_tables`), categorizes tables (`Distributed`, `Reference`, `Local`), enforces colocation keys, prunes worker shards, and emits Citus DDL
 - 🗄️ **Declarative PostgreSQL Partitioning** — Transparently introspects and reconstructs partition trees (`PARTITION BY RANGE/LIST/HASH`), routing streams through the logical root relation
 - 🛡️ **Row-Level Security (RLS) Awareness** — `--bypass-rls` executes `SET row_security = off;` on Postgres connections; `--verify` distinctly categorizes `Valid`, `Policy-Excluded`, and `Corrupted/Orphan`
 - ✂️ **Stratified Child Sampling** — `--children-per-parent N` uniformly samples child entities across parent nodes via SQL window ranking functions while preserving referential integrity
@@ -60,6 +61,66 @@
 | **Parent/Child Batching** | `= ANY($1::type[])` (≤10k) / `UNLOGGED` temp table (>10k) | Chunked `IN (...)` queries in batches of 2,000 | Direct high-throughput batch hydration |
 | **Target Hydration** | Zero-copy binary `COPY FROM` stream | Transactional bulk inserts & two-phase updates | High-throughput bulk loading PRAGMAs + deferred FK transaction |
 | **Integrity Verification** | Custom LEFT JOIN orphan queries (`--verify`) | Custom LEFT JOIN orphan queries (`--verify`) | Automated `PRAGMA foreign_key_check;` (`--verify`) |
+
+---
+
+## Citus Distributed Table Introspection & Colocation (v1.0.0)
+
+Citus extends PostgreSQL into a distributed database using coordinator-worker architecture, shard distribution, and table colocation. `dbdrain` natively understands Citus cluster topologies, transparently subsetting multi-tenant databases without manual configuration.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                   Citus Coordinator Logical Discovery                  │
+│                                                                        │
+│   Logical Table: "users" (Distributed by "tenant_id", Colocation 1)    │
+│   Logical Table: "orders" (Distributed by "tenant_id", Colocation 1)   │
+│   Logical Table: "countries" (Reference Table, Replicated Everywhere)  │
+│                                                                        │
+│   Physical Shards: users_102008, orders_102009 (PRUNED & FILTERED)     │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                         Joint Tenant Boundary
+                         ("tenant_id" IN ('42'))
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                 Referentially Intact Tenant Extraction                 │
+│                                                                        │
+│   users WHERE tenant_id = 42 ───► orders WHERE tenant_id = 42         │
+│   (Zero leakage to tenant 43 even if primary keys collide across IDs)  │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Citus Capabilities:
+
+1. **Coordinator Metadata Discovery**:
+   - Detects whether the source runs Citus by querying `pg_extension WHERE extname = 'citus'` or `citus_tables`.
+   - Introspects distribution metadata from `citus_tables` and `pg_dist_partition`:
+     * **Distribution Column**: Discovers the partitioning key (e.g. `tenant_id`, `company_id`).
+     * **Distribution Method**: Hash (`h`), Reference (`n`), Range (`r`), or Append (`a`).
+     * **Colocation Group**: Discovers `colocation_id` to map colocated shard families.
+   - Categorizes every table as `Distributed`, `Reference`, or `Local`.
+
+2. **Physical Shard Pruning**:
+   - `dbdrain` automatically queries `pg_dist_shard` to discover all physical worker shard relations (e.g. `users_102008`, `orders_102009`).
+   - Physical shards are systematically pruned from column cataloging, primary keys, foreign keys, and graph node creation.
+   - Extractions **exclusively** execute through the coordinator's logical relations, allowing Citus to orchestrate distributed query planning.
+
+3. **Colocation & Foreign Key Topology**:
+   - Validates that foreign keys between distributed tables include the distribution column and share the same colocation group.
+   - Emits descriptive warnings if an invalid foreign key spans disparate colocation groups.
+
+4. **Joint Tenant Boundary Preservation**:
+   - In multi-tenant systems, colocated tables share the distribution key. When an extraction begins with an anchor query on a tenant (e.g. `--from "users WHERE tenant_id = '42'"`), `dbdrain` captures the active tenant key set for that colocation group.
+   - As traversal moves to downstream children or upstream parents (e.g. `orders`, `invoices`, `memberships`), `dbdrain` injects the joint tenant boundary condition (`"tenant_id" IN ('42')`).
+   - This ensures absolute tenant isolation and prevents cross-tenant row contamination even when child primary keys collide across tenants.
+
+5. **Target Citus DDL Emission**:
+   - When generating PostgreSQL target DDL or streaming to a Citus target, `dbdrain` emits the appropriate distribution calls:
+     ```sql
+     -- Emitted after CREATE TABLE before data streaming:
+     SELECT create_distributed_table('users', 'tenant_id');
+     SELECT create_reference_table('countries');
+     ```
 
 ---
 
@@ -291,55 +352,92 @@ If backpressure thresholds are breached, the status monitor alerts the user and 
 
 ---
 
+## Installation Matrix & Distribution
+
+| Channel | Platform | Command |
+|---------|----------|---------|
+| **npm / npx** | Cross-Platform (Node.js 18+) | `npx @dbdrain/cli` or `npm install -g @dbdrain/cli` |
+| **Homebrew** | macOS & Linux | `brew install x7ssss/tap/dbdrain` |
+| **Scoop** | Windows 10/11 / Windows Server | `scoop bucket add x7ssss https://github.com/x7ssss/scoop-bucket`<br>`scoop install dbdrain` |
+| **Direct Binary** | Linux (`amd64`, `arm64`)<br>macOS (`arm64`, `amd64`)<br>Windows (`amd64`, `arm64`) | [GitHub Releases](https://github.com/x7ssss/dbdrain/releases/latest) |
+| **Go Install** | Go 1.22+ Toolchain | `go install github.com/x7ssss/dbdrain/cmd/dbdrain@v1.0.0` |
+
+### 1. Run with npx (Zero Installation)
+
+No manual binary installation required. Automatically fetches and runs the matching native binary for your OS and CPU:
+
+```bash
+# Run immediately via npx
+npx @dbdrain/cli --source "postgres://user:pass@prod-host/mydb" \
+                 --from "users WHERE id IN (1, 2, 3) LIMIT 50" \
+                 --anonymize-pii \
+                 --output slice.sql
+
+# Or install globally
+npm install -g @dbdrain/cli
+```
+
+### 2. Homebrew (macOS / Linux)
+
+```bash
+brew install x7ssss/tap/dbdrain
+dbdrain --version
+```
+
+### 3. Windows Scoop
+
+```powershell
+scoop bucket add x7ssss https://github.com/x7ssss/scoop-bucket
+scoop install dbdrain
+dbdrain --version
+```
+
+### 4. Direct Standalone Binary Downloads
+
+Precompiled static binaries with `CGO_ENABLED=0` and zero external dependencies:
+
+```bash
+# Linux (x86_64 / amd64)
+curl -L https://github.com/x7ssss/dbdrain/releases/latest/download/dbdrain-linux-amd64 -o dbdrain && chmod +x dbdrain
+
+# Linux (arm64 / aarch64)
+curl -L https://github.com/x7ssss/dbdrain/releases/latest/download/dbdrain-linux-arm64 -o dbdrain && chmod +x dbdrain
+
+# macOS (Apple Silicon / arm64)
+curl -L https://github.com/x7ssss/dbdrain/releases/latest/download/dbdrain-darwin-arm64 -o dbdrain && chmod +x dbdrain
+
+# macOS (Intel / amd64)
+curl -L https://github.com/x7ssss/dbdrain/releases/latest/download/dbdrain-darwin-amd64 -o dbdrain && chmod +x dbdrain
+
+# Windows (x86_64 / PowerShell)
+Invoke-WebRequest https://github.com/x7ssss/dbdrain/releases/latest/download/dbdrain-windows-amd64.exe -OutFile dbdrain.exe
+
+# Windows (arm64 / PowerShell)
+Invoke-WebRequest https://github.com/x7ssss/dbdrain/releases/latest/download/dbdrain-windows-arm64.exe -OutFile dbdrain.exe
+```
+
+---
+
 ## Quick Start
-
-### Run with npx (Node.js)
-
-No manual binary installation required:
 
 ```bash
 # PostgreSQL to SQL file
-npx dbdrain --source "postgres://user:pass@prod-host/mydb" \
-            --from "users WHERE id IN (1, 2, 3) LIMIT 50" \
-            --anonymize-pii \
-            --output slice.sql
+dbdrain --source "postgres://user:pass@prod-host/mydb" \
+        --from "users WHERE id IN (1, 2, 3) LIMIT 50" \
+        --anonymize-pii \
+        --output slice.sql
 
 # PostgreSQL direct to local SQLite database (auto-transpiles DDL)
-npx dbdrain --source "postgres://user:pass@prod-host/mydb" \
-            --from "users LIMIT 50" \
-            --target "./dev.db" \
-            --anonymize-pii
+dbdrain --source "postgres://user:pass@prod-host/mydb" \
+        --from "users LIMIT 50" \
+        --target "./dev.db" \
+        --anonymize-pii
 
 # MySQL to SQL file
-npx dbdrain --source "mysql://user:pass@prod-host:3306/mydb" \
-            --from "users WHERE id IN (1, 2, 3) LIMIT 50" \
-            --anonymize-pii \
-            --output slice.sql
-```
-
-Or install globally via npm:
-
-```bash
-npm install -g dbdrain
-```
-
-### Download Standalone Binary
-
-```bash
-# Linux (amd64)
-curl -L https://github.com/x7ssss/dbdrain/releases/latest/download/dbdrain-linux-amd64 -o dbdrain
-chmod +x dbdrain
-
-# macOS (Apple Silicon)
-curl -L https://github.com/x7ssss/dbdrain/releases/latest/download/dbdrain-darwin-arm64 -o dbdrain
-chmod +x dbdrain
-
-# macOS (Intel)
-curl -L https://github.com/x7ssss/dbdrain/releases/latest/download/dbdrain-darwin-amd64 -o dbdrain
-chmod +x dbdrain
-
-# Windows (PowerShell)
-Invoke-WebRequest https://github.com/x7ssss/dbdrain/releases/latest/download/dbdrain-windows-amd64.exe -OutFile dbdrain.exe
+dbdrain --source "mysql://user:pass@prod-host:3306/mydb" \
+        --from "users WHERE id IN (1, 2, 3) LIMIT 50" \
+        --anonymize-pii \
+        --output slice.sql
 ```
 
 ### Build from source
@@ -533,6 +631,8 @@ If foreign key violations are detected:
 
 ---
 
+---
+
 ## Architecture
 
 ```
@@ -550,32 +650,67 @@ dbdrain --from "users WHERE id=1"
     │                  maps UUID/JSON/ENUM/ARRAY/INET/DATETIME to SQLite types
     │
     ├─ internal/config/config.go
-    │    └─ Loads dbdrain.yaml: masking rules, virtual FK declarations
+    │    └─ Loads dbdrain.yaml: masking rules, virtual FK declarations, associations
     │
     ├─ internal/introspect/
-    │    ├─ postgres.go: information_schema + pg_constraint catalog discovery
+    │    ├─ postgres.go: information_schema + pg_constraint + Citus catalogs + pg_partitioned_table
+    │    │               discovers Citus distribution columns, colocation groups & reference tables
+    │    │               filters physical worker shards and validates distributed FK topology
     │    └─ mysql.go: information_schema catalog discovery + MyISAM warning
     │
     ├─ internal/graph/
-    │    ├─ graph.go & query.go: Directed adjacency-list FK graph
-    │    └─ tarjan.go: Tarjan's SCC algorithm for cycle detection
+    │    ├─ graph.go & query.go: Directed adjacency-list FK graph with Keyset queue
+    │    ├─ tarjan.go: Tarjan's SCC algorithm for circular dependency detection
+    │    └─ upstream.go: Strict upward-only recursive DAG closure for leaf anchors
     │
     ├─ internal/drain/
     │    ├─ export.go: Consistent snapshot traversal, recursive CTE self-ref, BFS upward/downward
+    │    │             joint tenant boundary preservation across colocated Citus tables
+    │    ├─ batcher.go: Keyset pagination & stratified child sampling with window rank functions
     │    ├─ twophase.go: Two-Phase Insert Resolution for MySQL (Phase 1 NULL insert, Phase 2 UPDATE)
     │    ├─ format.go: Engine-specific SQL literal formatting (Postgres, MySQL, SQLite)
     │    └─ copy_source.go: CursorCopySource (pgx.CopyFromSource) + sync.Pool buffer recycling
+    │
+    ├─ internal/safety/
+    │    ├─ poller.go: Autonomous cluster health poller (InnoDB history list & replica lag)
+    │    └─ adaptive.go: Proportional-integral backpressure controller
+    │
+    ├─ internal/throttle/
+    │    └─ limiter.go: Token-bucket rate limiter and worker concurrency semaphore
     │
     ├─ internal/anonymize/mask.go
     │    └─ HMAC-SHA256 masking: fake_email, redact, uuid_remap, hmac_phone, hmac_name, hmac_token
     │
     ├─ internal/verify/verify.go
-    │    ├─ LEFT JOIN orphan checks on target PostgreSQL / MySQL
+    │    ├─ LEFT JOIN orphan checks on target PostgreSQL / MySQL with RLS categorization
     │    └─ RunSQLite: PRAGMA foreign_key_check on target SQLite
     │
+    ├─ .github/workflows/
+    │    └─ release.yml: CI/CD tag release, GoReleaser, Homebrew, Scoop, npm Trusted Publishing
+    │
+    ├─ .goreleaser.yaml: Multi-architecture cross-compiler & packaging specification
+    │
     └─ npm/
-         ├─ dbdrain/ (runner.cjs: cross-platform binary launcher for npx/npm)
-         └─ platforms/ (os/cpu targeted packages: linux-x64, darwin-arm64, darwin-x64, win32-x64)
+         ├─ cli/ (runner.cjs: cross-platform binary launcher for @dbdrain/cli)
+         ├─ dbdrain/ (runner.cjs: launcher for dbdrain)
+         └─ platforms/ (os/cpu targeted packages: linux-x64, linux-arm64, darwin-arm64, darwin-x64, win32-x64, win32-arm64)
+```
+
+```mermaid
+flowchart TD
+    A["Seed Anchor (--from)"] --> B["Coordinator & Engine Discovery (Postgres / Citus / MySQL)"]
+    B --> C["Catalog Introspection (Columns, PKs, FKs, Partitions, Citus Shard Pruning)"]
+    C --> D["Dependency Graph & Tarjan SCC Cycle Resolution"]
+    D --> E["Non-Locking Consistent Snapshot (REPEATABLE READ)"]
+    E --> F["DAG Traversal: Keyset Seek / BFS Upstream & Downward"]
+    F --> G["Joint Tenant Boundary Preservation (Colocated Distributed Tables)"]
+    G --> H["Deterministic HMAC-SHA256 Masking (dbdrain.yaml)"]
+    H --> I{"Target Mode"}
+    I -->|"Target DB Stream"| J["Zero-Copy Binary COPY / Target Transaction"]
+    I -->|"SQLite Target"| K["Auto DDL Transpilation & Deferred FK Loading"]
+    I -->|"SQL Dump"| L["Referentially Intact SQL File Emission"]
+    J --> M["Integrity Verification (--verify)"]
+    K --> M
 ```
 
 ---
@@ -587,15 +722,28 @@ dbdrain --from "users WHERE id=1"
 go test ./...
 
 # Cross-compile release binaries (CGO_ENABLED=0 pure-Go)
-GOOS=linux   GOARCH=amd64  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/dbdrain-linux-amd64   ./cmd/dbdrain/
-GOOS=darwin  GOARCH=arm64  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/dbdrain-darwin-arm64  ./cmd/dbdrain/
-GOOS=darwin  GOARCH=amd64  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/dbdrain-darwin-amd64  ./cmd/dbdrain/
-GOOS=windows GOARCH=amd64  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/dbdrain-windows-amd64.exe ./cmd/dbdrain/
+GOOS=linux   GOARCH=amd64  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/dbdrain-linux-amd64       ./cmd/dbdrain/
+GOOS=linux   GOARCH=arm64  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/dbdrain-linux-arm64       ./cmd/dbdrain/
+GOOS=darwin  GOARCH=arm64  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/dbdrain-darwin-arm64      ./cmd/dbdrain/
+GOOS=darwin  GOARCH=amd64  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/dbdrain-darwin-amd64      ./cmd/dbdrain/
+GOOS=windows GOARCH=amd64  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/dbdrain-windows-amd64.exe   ./cmd/dbdrain/
+GOOS=windows GOARCH=arm64  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/dbdrain-windows-arm64.exe   ./cmd/dbdrain/
 ```
 
 ---
 
 ## Changelog
+
+### v1.0.0
+- 🌐 **Citus Distributed Table Introspection & Colocation**: Native awareness for Citus distributed clusters. Detects Citus via `pg_extension` and `citus_tables`, categorizes tables into `Distributed`, `Reference`, and `Local`, discovers distribution columns, distribution methods (hash/reference/range), and colocation IDs.
+- 🛡️ **Physical Worker Shard Pruning**: Prunes physical worker shards (`users_102008`) discovered from `pg_dist_shard` to ensure extractions route exclusively through the coordinator's logical relations.
+- 🔗 **Colocation & Foreign Key Topology**: Validates that foreign keys between distributed tables include the distribution column and belong to the same colocation group.
+- 🏢 **Joint Tenant Boundary Preservation**: In multi-tenant Citus setups, extracts strictly preserve the joint tenant boundary across colocated tables, preventing tenant leakage even when child entity primary keys collide across tenants.
+- 🏗️ **Target Citus DDL Emission**: Automatically emits `SELECT create_distributed_table(...)` and `SELECT create_reference_table(...)` calls before streaming rows.
+- 🚀 **GoReleaser Release Pipeline (`.goreleaser.yaml`)**: Static builds (`CGO_ENABLED=0`) across 6 architectures (`linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`, `windows/amd64`, `windows/arm64`) with SHA-256 `checksums.txt`.
+- 🍺 **Homebrew Tap Automation**: Automated formula updates published to `x7ssss/homebrew-tap` (`dbdrain`).
+- 🪣 **Windows Scoop Bucket Automation**: Automated Scoop manifest updates published to `x7ssss/scoop-bucket` (`dbdrain.json`).
+- 📦 **npm OIDC Trusted Publishing Pipeline**: GitHub Actions release workflow publishing platform packages (`@dbdrain/*`) and root launcher (`@dbdrain/cli`) with provenance.
 
 ### v0.9.0
 - 🌲 **Reverse Subsetting & Upstream Ancestry Pruning (`--upstream`)**: Treats `--from` as an isolated leaf incident anchor, computing a strict upward-only recursive DAG closure along outgoing foreign keys while pruning all sibling and downstream branches.

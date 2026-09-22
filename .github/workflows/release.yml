@@ -1,0 +1,180 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  test:
+    name: Run Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Run Tests
+        run: go test -v ./...
+
+  goreleaser:
+    name: GoReleaser Multi-Platform Release
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+
+  npm-publish:
+    name: Publish to npm (Trusted Publishing)
+    needs: [test, goreleaser]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download Release Binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist_release
+          gh release download ${{ github.ref_name }} --dir dist_release
+
+          mkdir -p npm/platforms/linux-x64/bin
+          mkdir -p npm/platforms/linux-arm64/bin
+          mkdir -p npm/platforms/darwin-x64/bin
+          mkdir -p npm/platforms/darwin-arm64/bin
+          mkdir -p npm/platforms/win32-x64/bin
+          mkdir -p npm/platforms/win32-arm64/bin
+
+          tar -xzf dist_release/dbdrain_*_linux_amd64.tar.gz -C npm/platforms/linux-x64/bin dbdrain
+          tar -xzf dist_release/dbdrain_*_linux_arm64.tar.gz -C npm/platforms/linux-arm64/bin dbdrain
+          tar -xzf dist_release/dbdrain_*_darwin_amd64.tar.gz -C npm/platforms/darwin-x64/bin dbdrain
+          tar -xzf dist_release/dbdrain_*_darwin_arm64.tar.gz -C npm/platforms/darwin-arm64/bin dbdrain
+          unzip -p dist_release/dbdrain_*_windows_amd64.zip dbdrain.exe > npm/platforms/win32-x64/bin/dbdrain.exe
+          unzip -p dist_release/dbdrain_*_windows_arm64.zip dbdrain.exe > npm/platforms/win32-arm64/bin/dbdrain.exe
+          chmod +x npm/platforms/*/bin/dbdrain*
+
+      - name: Synchronize Version and Stage @dbdrain Packages
+        run: |
+          RAW_VERSION=${{ github.ref_name }}
+          VERSION=${RAW_VERSION#v}
+          echo "Synchronizing npm manifests to version: $VERSION"
+
+          mkdir -p npm/platforms/@dbdrain
+
+          for plat in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64; do
+            if [ -f "npm/platforms/$plat/package.json" ]; then
+              node -e "
+                const fs = require('fs');
+                const file = 'npm/platforms/$plat/package.json';
+                const json = JSON.parse(fs.readFileSync(file));
+                json.version = '$VERSION';
+                fs.writeFileSync(file, JSON.stringify(json, null, 2) + '\n');
+              "
+              # Stage into npm/platforms/@dbdrain/*
+              mkdir -p "npm/platforms/@dbdrain/$plat"
+              cp -r "npm/platforms/$plat/"* "npm/platforms/@dbdrain/$plat/"
+            fi
+          done
+
+          # Update @dbdrain/cli launcher
+          if [ -f "npm/cli/package.json" ]; then
+            node -e "
+              const fs = require('fs');
+              const file = 'npm/cli/package.json';
+              const json = JSON.parse(fs.readFileSync(file));
+              json.version = '$VERSION';
+              for (const key of Object.keys(json.optionalDependencies || {})) {
+                json.optionalDependencies[key] = '$VERSION';
+              }
+              fs.writeFileSync(file, JSON.stringify(json, null, 2) + '\n');
+            "
+          fi
+
+          # Update legacy launcher if present
+          if [ -f "npm/dbdrain/package.json" ]; then
+            node -e "
+              const fs = require('fs');
+              const file = 'npm/dbdrain/package.json';
+              const json = JSON.parse(fs.readFileSync(file));
+              json.version = '$VERSION';
+              for (const key of Object.keys(json.optionalDependencies || {})) {
+                json.optionalDependencies[key] = '$VERSION';
+              }
+              fs.writeFileSync(file, JSON.stringify(json, null, 2) + '\n');
+            "
+          fi
+
+      - name: Publish Platform Packages (Sequential & Idempotent)
+        run: |
+          for dir in npm/platforms/@dbdrain/*; do
+            if [ -d "$dir" ] && [ -f "$dir/package.json" ]; then
+              PKG_NAME=$(node -p "require('./$dir/package.json').name")
+              PKG_VER=$(node -p "require('./$dir/package.json').version")
+              echo "Checking platform package: $PKG_NAME@$PKG_VER"
+              if npm view "$PKG_NAME@$PKG_VER" version > /dev/null 2>&1; then
+                echo "$PKG_NAME@$PKG_VER is already published, skipping."
+              else
+                echo "Publishing platform package: $dir"
+                (cd "$dir" && npm publish --access public --provenance) || echo "Publish failed or already exists for $PKG_NAME"
+              fi
+            fi
+          done
+
+      - name: Publish Root Launcher Package (@dbdrain/cli)
+        run: |
+          if [ -d "npm/cli" ] && [ -f "npm/cli/package.json" ]; then
+            PKG_NAME=$(node -p "require('./npm/cli/package.json').name")
+            PKG_VER=$(node -p "require('./npm/cli/package.json').version")
+            echo "Publishing root launcher package: $PKG_NAME@$PKG_VER"
+            if npm view "$PKG_NAME@$PKG_VER" version > /dev/null 2>&1; then
+              echo "$PKG_NAME@$PKG_VER is already published, skipping."
+            else
+              (cd npm/cli && npm publish --access public --provenance) || echo "Publish failed or already exists for $PKG_NAME"
+            fi
+          fi
+          if [ -d "npm/dbdrain" ] && [ -f "npm/dbdrain/package.json" ]; then
+            PKG_NAME=$(node -p "require('./npm/dbdrain/package.json').name")
+            PKG_VER=$(node -p "require('./npm/dbdrain/package.json').version")
+            echo "Publishing launcher package: $PKG_NAME@$PKG_VER"
+            if npm view "$PKG_NAME@$PKG_VER" version > /dev/null 2>&1; then
+              echo "$PKG_NAME@$PKG_VER is already published, skipping."
+            else
+              (cd npm/dbdrain && npm publish --access public --provenance) || echo "Publish failed or already exists for $PKG_NAME"
+            fi
+          fi

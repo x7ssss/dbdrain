@@ -1,12 +1,12 @@
 {
-  "name": "@dbdrain/darwin-x64",
+  "name": "@dbdrain/win32-arm64",
   "version": "1.0.0",
-  "description": "dbdrain native binary for macOS x64 (Intel)",
+  "description": "dbdrain native binary for Windows ARM64",
   "os": [
-    "darwin"
+    "win32"
   ],
   "cpu": [
-    "x64"
+    "arm64"
   ],
   "license": "MIT",
   "repository": {

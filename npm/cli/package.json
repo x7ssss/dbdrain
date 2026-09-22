@@ -1,0 +1,24 @@
+{
+  "name": "@dbdrain/cli",
+  "version": "1.0.0",
+  "description": "Zero-downtime PostgreSQL, Citus distributed tables, MySQL/MariaDB & SQLite database subsetting, polymorphic FK resolution & deterministic PII masking CLI",
+  "bin": {
+    "dbdrain": "./bin/runner.cjs"
+  },
+  "files": [
+    "bin"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/x7ssss/dbdrain.git"
+  },
+  "optionalDependencies": {
+    "@dbdrain/darwin-arm64": "1.0.0",
+    "@dbdrain/darwin-x64": "1.0.0",
+    "@dbdrain/linux-arm64": "1.0.0",
+    "@dbdrain/linux-x64": "1.0.0",
+    "@dbdrain/win32-arm64": "1.0.0",
+    "@dbdrain/win32-x64": "1.0.0"
+  }
+}

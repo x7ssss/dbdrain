@@ -1,7 +1,7 @@
 {
   "name": "dbdrain",
-  "version": "0.9.0",
-  "description": "Zero-downtime PostgreSQL, MySQL/MariaDB & SQLite database subsetting & deterministic PII masking CLI",
+  "version": "1.0.0",
+  "description": "Zero-downtime PostgreSQL, MySQL/MariaDB & SQLite database subsetting, polymorphic FK resolution & deterministic PII masking CLI",
   "bin": {
     "dbdrain": "./bin/runner.cjs"
   },
@@ -14,9 +14,17 @@
     "url": "https://github.com/x7ssss/dbdrain.git"
   },
   "optionalDependencies": {
-    "@x7ssss/dbdrain-linux-x64": "0.9.0",
-    "@x7ssss/dbdrain-darwin-arm64": "0.9.0",
-    "@x7ssss/dbdrain-darwin-x64": "0.9.0",
-    "@x7ssss/dbdrain-win32-x64": "0.9.0"
+    "@dbdrain/darwin-arm64": "1.0.0",
+    "@dbdrain/darwin-x64": "1.0.0",
+    "@dbdrain/linux-arm64": "1.0.0",
+    "@dbdrain/linux-x64": "1.0.0",
+    "@dbdrain/win32-arm64": "1.0.0",
+    "@dbdrain/win32-x64": "1.0.0",
+    "@x7ssss/dbdrain-darwin-arm64": "1.0.0",
+    "@x7ssss/dbdrain-darwin-x64": "1.0.0",
+    "@x7ssss/dbdrain-linux-arm64": "1.0.0",
+    "@x7ssss/dbdrain-linux-x64": "1.0.0",
+    "@x7ssss/dbdrain-win32-arm64": "1.0.0",
+    "@x7ssss/dbdrain-win32-x64": "1.0.0"
   }
 }

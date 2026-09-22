@@ -70,7 +70,7 @@ func New(schema *introspect.Schema, virtualFKs ...[]VirtualFKInput) *Graph {
 	}
 
 	for table := range schema.Columns {
-		if schema != nil && schema.IsChildPartition(table) {
+		if schema != nil && (schema.IsChildPartition(table) || schema.IsPhysicalShard(table)) {
 			continue
 		}
 		g.Nodes[table] = &Node{Table: table}
@@ -85,6 +85,9 @@ func New(schema *introspect.Schema, virtualFKs ...[]VirtualFKInput) *Graph {
 	}
 
 	for _, fk := range schema.ForeignKeys {
+		if schema != nil && (schema.IsPhysicalShard(fk.FromTable) || schema.IsPhysicalShard(fk.ToTable)) {
+			continue
+		}
 		fromTable := fk.FromTable
 		toTable := fk.ToTable
 		if schema != nil {

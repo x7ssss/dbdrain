@@ -180,7 +180,7 @@ func (sum *Summary) Print(w io.Writer) {
 	}
 
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, headerStyle.Render("  dbdrain v0.9.0  — slice complete ("+modeLabel+")"))
+	fmt.Fprintln(w, headerStyle.Render("  dbdrain v1.0.0  — slice complete ("+modeLabel+")"))
 	if sum.NumAnchors > 0 || sum.ChildrenPerParent > 0 {
 		fmt.Fprintf(w, "  %s\n", FormatSamplingMetrics(sum.ChildrenPerParent, sum.NumAnchors))
 	}

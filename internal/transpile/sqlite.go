@@ -165,7 +165,7 @@ func GenerateSchemaDDL(schema *introspect.Schema, tables []string) string {
 
 	var ddlStatements []string
 	for _, tbl := range tables {
-		if schema != nil && schema.IsChildPartition(tbl) {
+		if schema != nil && (schema.IsChildPartition(tbl) || schema.IsPhysicalShard(tbl)) {
 			continue
 		}
 		if _, exists := schema.Columns[tbl]; exists {
