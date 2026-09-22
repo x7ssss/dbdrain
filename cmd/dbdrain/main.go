@@ -19,11 +19,12 @@ import (
 	"github.com/x7ssss/dbdrain/internal/drain"
 	"github.com/x7ssss/dbdrain/internal/graph"
 	"github.com/x7ssss/dbdrain/internal/introspect"
+	"github.com/x7ssss/dbdrain/internal/transpile"
 	"github.com/x7ssss/dbdrain/internal/ui"
 	"github.com/x7ssss/dbdrain/internal/verify"
 )
 
-const version = "v0.5.0"
+const version = "v0.6.0"
 
 var (
 	source          string
@@ -41,16 +42,19 @@ var (
 
 var rootCmd = &cobra.Command{
 	Use:   "dbdrain",
-	Short: "High-performance PostgreSQL & MySQL/MariaDB database slicer and PII anonymizer",
+	Short: "High-performance PostgreSQL, MySQL/MariaDB & SQLite database slicer and PII anonymizer",
 	Long: `dbdrain ` + version + ` extracts referentially intact subsets from a production
-PostgreSQL or MySQL/MariaDB database, resolves circular FK dependencies (including
-two-phase insert/update resolution for MySQL), handles polymorphic associations,
-and deterministically masks PII.
+PostgreSQL or MySQL/MariaDB database, resolves circular FK dependencies, handles polymorphic
+associations, deterministically masks PII, and streams slices into PostgreSQL, MySQL, or SQLite.
 
 Examples:
   # Stream slice to stdout and pipe directly into psql
   dbdrain --source "postgres://user:pass@localhost/prod" \
           --from "users WHERE id IN (1,2,3) LIMIT 50" | psql postgres://localhost/staging
+
+  # Hydrate directly into a local SQLite database (auto-transpiled DDL)
+  dbdrain --source "postgres://user:pass@localhost/prod" \
+          --from "users LIMIT 10" --target "./dev.db" --anonymize-pii
 
   # Export MySQL slice to SQL file with two-phase circular resolution
   dbdrain --source "mysql://root:secret@localhost:3306/shop" \
@@ -74,7 +78,7 @@ func init() {
 	rootCmd.Flags().StringVar(&salt, "salt", "dbdrain-secret-salt", "Salt for deterministic HMAC masking")
 	rootCmd.Flags().IntVar(&maxRowsPerTable, "max-rows-per-table", 0, "Hard cap on rows pulled per child table (0 = unlimited)")
 	rootCmd.Flags().IntVar(&maxDepth, "depth", 0, "Max FK traversal depth for child tables (0 = unlimited; parents always fully resolved)")
-	rootCmd.Flags().StringVar(&target, "target", "", "Target database connection string for direct hydration (bypasses --output)")
+	rootCmd.Flags().StringVar(&target, "target", "", "Target database connection string or file (PostgreSQL, MySQL/MariaDB, or SQLite .db file) (bypasses --output)")
 	rootCmd.Flags().StringVar(&configPath, "config", "", "Path to dbdrain.yaml config file (auto-detected if omitted)")
 	rootCmd.Flags().BoolVar(&doVerify, "verify", false, "Run post-hydration orphan integrity checks on --target (requires --target)")
 
@@ -267,7 +271,56 @@ func runDrain(cmd *cobra.Command, args []string) error {
 
 		var uiViolations []ui.Violation
 
-		if targetEngine == db.EngineMySQL {
+		switch targetEngine {
+		case db.EngineSQLite:
+			sqlitePath := db.ParseSQLitePath(target)
+			spinnerMsg(fmt.Sprintf("Connecting to target SQLite database (%s)...", sqlitePath))
+
+			targetDB, err := sql.Open("sqlite", sqlitePath)
+			if err != nil {
+				stopSpinner()
+				return fmt.Errorf("open target sqlite: %w", err)
+			}
+			defer targetDB.Close()
+
+			if err := db.InitSQLiteDB(ctx, targetDB); err != nil {
+				stopSpinner()
+				return fmt.Errorf("init sqlite pragmas: %w", err)
+			}
+
+			// Generate schema DDL from source introspection and create tables
+			ddl := transpile.GenerateSchemaDDL(schema, nil)
+			if _, err := targetDB.ExecContext(ctx, ddl); err != nil {
+				stopSpinner()
+				return fmt.Errorf("create sqlite schema: %w", err)
+			}
+
+			spinnerMsg(fmt.Sprintf("Streaming '%s' → target SQLite...", anchorTable))
+			if err := exporter.ExportToTargetSQLite(ctx, targetDB, anchorTable, anchorWhere, anchorLimit, progressFn); err != nil {
+				stopSpinner()
+				return fmt.Errorf("stream to target sqlite: %w", err)
+			}
+
+			// Post-hydration integrity verification.
+			if doVerify {
+				spinnerMsg("Running integrity checks on SQLite target...")
+				violations, verifyErr := verify.RunSQLite(ctx, targetDB)
+				if verifyErr != nil {
+					stopSpinner()
+					return fmt.Errorf("integrity check: %w", verifyErr)
+				}
+				for _, v := range violations {
+					uiViolations = append(uiViolations, ui.Violation{
+						ChildTable:   v.ChildTable,
+						ChildColumn:  v.ChildColumn,
+						ParentTable:  v.ParentTable,
+						ParentColumn: v.ParentColumn,
+						OrphanCount:  v.OrphanCount,
+					})
+				}
+			}
+
+		case db.EngineMySQL:
 			spinnerMsg("Connecting to target MySQL database...")
 			targetDSN, targetDBName, err := db.ParseMySQLDSN(target)
 			if err != nil {
@@ -315,7 +368,8 @@ func runDrain(cmd *cobra.Command, args []string) error {
 					})
 				}
 			}
-		} else {
+
+		case db.EnginePostgres:
 			spinnerMsg("Connecting to target PostgreSQL database...")
 			targetConn, err := pgx.Connect(ctx, target)
 			if err != nil {

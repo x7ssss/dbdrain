@@ -80,15 +80,16 @@ func LoadPostgres(ctx context.Context, conn *pgx.Conn, schemaName string) (*Sche
 	// Load primary keys
 	pkRows, err := conn.Query(ctx, `
 		SELECT
-			cc.table_name,
-			array_agg(cc.column_name::text ORDER BY cc.ordinal_position) AS pk_columns
+			kcu.table_name,
+			array_agg(kcu.column_name::text ORDER BY kcu.ordinal_position) AS pk_columns
 		FROM information_schema.table_constraints tc
-		JOIN information_schema.constraint_column_usage cc
-			ON cc.constraint_name = tc.constraint_name
-			AND cc.table_schema = tc.table_schema
+		JOIN information_schema.key_column_usage kcu
+			ON kcu.constraint_name = tc.constraint_name
+			AND kcu.table_schema = tc.table_schema
+			AND kcu.table_name = tc.table_name
 		WHERE tc.constraint_type = 'PRIMARY KEY'
 			AND tc.table_schema = $1
-		GROUP BY cc.table_name
+		GROUP BY kcu.table_name
 	`, schemaName)
 	if err != nil {
 		return nil, fmt.Errorf("query primary keys: %w", err)

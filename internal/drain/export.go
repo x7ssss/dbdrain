@@ -701,6 +701,300 @@ SELECT DISTINCT * FROM hierarchy`,
 }
 
 // -------------------------------------------------------------------------
+// Direct target streaming mode: SQLite (Bulk loading with PRAGMA defer_foreign_keys)
+// -------------------------------------------------------------------------
+
+// ExportToTargetSQLite executes streaming hydration directly into an SQLite database file or memory instance.
+func (e *Exporter) ExportToTargetSQLite(
+	ctx context.Context,
+	targetDB *sql.DB,
+	anchorTable string,
+	anchorWhere string,
+	anchorLimit int,
+	progressFn func(table string, n int),
+) error {
+	sourceTx, err := e.sourceDB.BeginSnapshot(ctx)
+	if err != nil {
+		return fmt.Errorf("begin source snapshot: %w", err)
+	}
+	defer sourceTx.Rollback(ctx)
+
+	conn, err := targetDB.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire target sqlite connection: %w", err)
+	}
+	defer conn.Close()
+
+	// High-throughput bulk loading PRAGMAs:
+	// PRAGMA foreign_keys = ON;
+	// PRAGMA defer_foreign_keys = ON;
+	// BEGIN TRANSACTION;
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = ON;"); err != nil {
+		return fmt.Errorf("enable sqlite foreign keys: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA defer_foreign_keys = ON;"); err != nil {
+		return fmt.Errorf("enable sqlite defer_foreign_keys: %w", err)
+	}
+
+	targetTx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin target sqlite tx: %w", err)
+	}
+	defer targetTx.Rollback()
+
+	streamRowsToSQLite := func(table string, rows db.RowIterator) error {
+		if rows == nil {
+			return nil
+		}
+		defer rows.Close()
+
+		cols := e.schema.Columns[table]
+		if len(cols) == 0 {
+			return nil
+		}
+		colNames := colNameSlice(cols)
+		pkCols := e.schema.PrimaryKeys[table]
+
+		quotedCols := make([]string, len(colNames))
+		for i, c := range colNames {
+			quotedCols[i] = db.QuoteIdent(db.EngineSQLite, c)
+		}
+		quotedTable := db.QuoteTable(db.EngineSQLite, "", table)
+
+		for rows.Next() {
+			rawVals, err := rows.Values()
+			if err != nil {
+				return fmt.Errorf("row values %s: %w", table, err)
+			}
+			pk := buildPK(pkCols, colNames, rawVals)
+			if e.markVisited(table, pk) {
+				continue
+			}
+
+			e.applyMasking(table, cols, rawVals)
+			e.capturePolyData(table, colNames, rawVals)
+
+			valuesClause := FormatValues(db.EngineSQLite, cols, rawVals)
+			stmt := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s);",
+				quotedTable,
+				strings.Join(quotedCols, ", "),
+				valuesClause,
+			)
+
+			if _, err := targetTx.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("target sqlite insert into %s: %w", table, err)
+			}
+
+			e.RowCounts[table]++
+			if progressFn != nil {
+				progressFn(table, 1)
+			}
+		}
+		return rows.Err()
+	}
+
+	// 1. Stream self-referencing hierarchy if present
+	if e.isSelfRef(anchorTable) {
+		edge := e.selfRefEdge(anchorTable)
+		if edge != nil && len(edge.FromColumns) == 1 && len(edge.ToColumns) == 1 {
+			childCol, parentCol := edge.FromColumns[0], edge.ToColumns[0]
+			cols := e.schema.Columns[anchorTable]
+			colNames := colNameSlice(cols)
+			quotedCols := make([]string, len(colNames))
+			for i, c := range colNames {
+				quotedCols[i] = "t." + db.QuoteIdent(e.engine, c)
+			}
+			selectCols := strings.Join(quotedCols, ", ")
+			seedWhere, seedLimit := buildSeedClauses(anchorWhere, anchorLimit)
+
+			cteSQL := fmt.Sprintf(`
+WITH RECURSIVE hierarchy AS (
+  SELECT %s FROM %s t %s %s
+  UNION
+  SELECT %s FROM %s t INNER JOIN hierarchy h ON t.%s = h.%s
+  UNION
+  SELECT %s FROM %s t INNER JOIN hierarchy h ON t.%s = h.%s
+)
+SELECT DISTINCT * FROM hierarchy`,
+				selectCols, db.QuoteTable(e.engine, e.cfg.Schema, anchorTable), seedWhere, seedLimit,
+				selectCols, db.QuoteTable(e.engine, e.cfg.Schema, anchorTable), db.QuoteIdent(e.engine, parentCol), db.QuoteIdent(e.engine, childCol),
+				selectCols, db.QuoteTable(e.engine, e.cfg.Schema, anchorTable), db.QuoteIdent(e.engine, childCol), db.QuoteIdent(e.engine, parentCol),
+			)
+
+			rows, err := sourceTx.Query(ctx, cteSQL)
+			if err != nil {
+				return fmt.Errorf("recursive CTE %s: %w", anchorTable, err)
+			}
+			if err := streamRowsToSQLite(anchorTable, rows); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 2. Stream anchor seed rows
+	{
+		cols := e.schema.Columns[anchorTable]
+		if len(cols) > 0 {
+			colNames := colNameSlice(cols)
+			query := e.buildQuery(e.cfg.Schema, anchorTable, colNames, anchorWhere, anchorLimit)
+			rows, err := sourceTx.Query(ctx, query)
+			if err != nil {
+				return fmt.Errorf("query anchor %s: %w", anchorTable, err)
+			}
+			if err := streamRowsToSQLite(anchorTable, rows); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 3. Upward BFS traversal: stream mandatory parents
+	{
+		queue := []string{anchorTable}
+		enqueued := map[string]bool{anchorTable: true}
+
+		for len(queue) > 0 {
+			table := queue[0]
+			queue = queue[1:]
+
+			for _, edge := range e.g.OutEdges[table] {
+				parent := edge.ToTable
+				if parent == table || len(edge.ToColumns) != 1 {
+					continue
+				}
+				fkVals := e.visitedPKs(table)
+				if len(fkVals) == 0 {
+					continue
+				}
+
+				parentCols := e.schema.Columns[parent]
+				colNames := colNameSlice(parentCols)
+				colInfo := findColumnByName(parentCols, edge.ToColumns[0])
+
+				rows, err := queryByIDs(ctx, sourceTx, e.engine, e.cfg.Schema, parent, colNames, edge.ToColumns[0], colInfo, fkVals, 0)
+				if err != nil {
+					return fmt.Errorf("query parents of %s: %w", parent, err)
+				}
+				if err := streamRowsToSQLite(parent, rows); err != nil {
+					return err
+				}
+
+				if !enqueued[parent] {
+					enqueued[parent] = true
+					queue = append(queue, parent)
+				}
+			}
+
+			// Virtual FK polymorphic parents
+			for _, ve := range e.g.VirtualEdges[table] {
+				grouped := map[string][]string{}
+				for _, pp := range e.polyData[table][ve.DiscriminatorCol] {
+					grouped[pp.discVal] = append(grouped[pp.discVal], pp.fkVal)
+				}
+				for discVal, fkVals := range grouped {
+					tc, ok := ve.Mappings[discVal]
+					if !ok {
+						continue
+					}
+					parentCols := e.schema.Columns[tc.Table]
+					colNames := colNameSlice(parentCols)
+					colInfo := findColumnByName(parentCols, tc.Column)
+
+					rows, err := queryByIDs(ctx, sourceTx, e.engine, e.cfg.Schema, tc.Table, colNames, tc.Column, colInfo, fkVals, 0)
+					if err != nil {
+						return fmt.Errorf("virtual FK query (%s→%s): %w", table, tc.Table, err)
+					}
+					if err := streamRowsToSQLite(tc.Table, rows); err != nil {
+						return err
+					}
+
+					if !enqueued[tc.Table] {
+						enqueued[tc.Table] = true
+						queue = append(queue, tc.Table)
+					}
+				}
+			}
+		}
+	}
+
+	// 4. Downward BFS traversal: stream child tables
+	{
+		type work struct {
+			table string
+			depth int
+		}
+		queue := []work{{anchorTable, 0}}
+		enqueued := map[string]bool{anchorTable: true}
+
+		for len(queue) > 0 {
+			item := queue[0]
+			queue = queue[1:]
+
+			if e.cfg.MaxDepth > 0 && item.depth >= e.cfg.MaxDepth {
+				continue
+			}
+
+			for _, edge := range e.g.InEdges[item.table] {
+				child := edge.FromTable
+				if child == item.table || len(edge.FromColumns) != 1 {
+					continue
+				}
+				fkVals := e.visitedPKs(item.table)
+				if len(fkVals) == 0 {
+					continue
+				}
+
+				childCols := e.schema.Columns[child]
+				colNames := colNameSlice(childCols)
+				colInfo := findColumnByName(childCols, edge.FromColumns[0])
+
+				rows, err := queryByIDs(ctx, sourceTx, e.engine, e.cfg.Schema, child, colNames, edge.FromColumns[0], colInfo, fkVals, e.cfg.MaxRowsPerTable)
+				if err != nil {
+					return fmt.Errorf("query children %s: %w", child, err)
+				}
+				if err := streamRowsToSQLite(child, rows); err != nil {
+					return err
+				}
+
+				if !enqueued[child] {
+					enqueued[child] = true
+					queue = append(queue, work{child, item.depth + 1})
+				}
+			}
+		}
+	}
+
+	// Commit transaction
+	if err := targetTx.Commit(); err != nil {
+		return fmt.Errorf("commit sqlite transaction: %w", err)
+	}
+
+	// Follow with PRAGMA foreign_key_check to ensure 0 integrity violations
+	fkRows, err := conn.QueryContext(ctx, "PRAGMA foreign_key_check;")
+	if err != nil {
+		return fmt.Errorf("run sqlite foreign_key_check: %w", err)
+	}
+	defer fkRows.Close()
+
+	var violations []string
+	for fkRows.Next() {
+		var tbl, rowid, parent, fkid string
+		if err := fkRows.Scan(&tbl, &rowid, &parent, &fkid); err != nil {
+			return fmt.Errorf("scan foreign_key_check violation: %w", err)
+		}
+		violations = append(violations, fmt.Sprintf("table %s (rowid %s) -> parent %s (fkid %s)", tbl, rowid, parent, fkid))
+	}
+	if err := fkRows.Err(); err != nil {
+		return fmt.Errorf("sqlite foreign_key_check rows: %w", err)
+	}
+
+	if len(violations) > 0 {
+		return fmt.Errorf("sqlite foreign key check failed (%d violations): %s", len(violations), strings.Join(violations, "; "))
+	}
+
+	return nil
+}
+
+// -------------------------------------------------------------------------
 // Self-referencing hierarchy resolution (SQL text emission path)
 // -------------------------------------------------------------------------
 

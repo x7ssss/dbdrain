@@ -1,6 +1,7 @@
 package drain
 
 import (
+	"database/sql/driver"
 	"fmt"
 	"strings"
 	"time"
@@ -15,9 +16,21 @@ func FormatValue(engine db.EngineType, col introspect.Column, v any) string {
 		return "NULL"
 	}
 
+	if valuer, ok := v.(driver.Valuer); ok {
+		val, err := valuer.Value()
+		if err != nil || val == nil {
+			return "NULL"
+		}
+		dt := strings.ToLower(col.DataType)
+		if strings.Contains(dt, "numeric") || strings.Contains(dt, "decimal") {
+			return fmt.Sprintf("%v", val)
+		}
+		return FormatValue(engine, col, val)
+	}
+
 	switch val := v.(type) {
 	case bool:
-		if engine == db.EngineMySQL {
+		if engine == db.EngineMySQL || engine == db.EngineSQLite {
 			if val {
 				return "1"
 			}
@@ -49,13 +62,13 @@ func FormatValue(engine db.EngineType, col introspect.Column, v any) string {
 			return "'" + escapePostgresString(string(val)) + "'"
 		}
 		// Binary types
-		if engine == db.EngineMySQL {
+		if engine == db.EngineMySQL || engine == db.EngineSQLite {
 			return fmt.Sprintf("X'%X'", val)
 		}
 		return fmt.Sprintf("'\\x%x'", val)
 
 	case time.Time:
-		if engine == db.EngineMySQL {
+		if engine == db.EngineMySQL || engine == db.EngineSQLite {
 			if val.Nanosecond() == 0 {
 				return fmt.Sprintf("'%s'", val.UTC().Format("2006-01-02 15:04:05"))
 			}

@@ -129,6 +129,31 @@ WHERE c.%s IS NOT NULL AND p.%s IS NULL`,
 	return violations, nil
 }
 
+// RunSQLite executes PRAGMA foreign_key_check on an SQLite target database.
+func RunSQLite(ctx context.Context, targetDB *sql.DB) ([]Violation, error) {
+	rows, err := targetDB.QueryContext(ctx, "PRAGMA foreign_key_check;")
+	if err != nil {
+		return nil, fmt.Errorf("run sqlite foreign_key_check: %w", err)
+	}
+	defer rows.Close()
+
+	var violations []Violation
+	for rows.Next() {
+		var tbl, rowid, parent, fkid string
+		if err := rows.Scan(&tbl, &rowid, &parent, &fkid); err != nil {
+			return nil, fmt.Errorf("scan foreign_key_check: %w", err)
+		}
+		violations = append(violations, Violation{
+			ChildTable:   tbl,
+			ChildColumn:  fmt.Sprintf("rowid:%s", rowid),
+			ParentTable:  parent,
+			ParentColumn: fmt.Sprintf("fk:%s", fkid),
+			OrphanCount:  1,
+		})
+	}
+	return violations, rows.Err()
+}
+
 // FormatReport returns a human-readable summary of violations for TTY output.
 func FormatReport(violations []Violation) string {
 	if len(violations) == 0 {

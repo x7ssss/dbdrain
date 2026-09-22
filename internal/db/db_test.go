@@ -16,7 +16,10 @@ func TestDetectEngine(t *testing.T) {
 		{"mariadb://root:pass@localhost:3306/db", EngineMySQL, false},
 		{"root:pass@tcp(127.0.0.1:3306)/db?charset=utf8mb4", EngineMySQL, false},
 		{"root:pass@unix(/tmp/mysql.sock)/db", EngineMySQL, false},
-		{"sqlite://file.db", "", true},
+		{"sqlite://file.db", EngineSQLite, false},
+		{"./dev.db", EngineSQLite, false},
+		{"staging.sqlite", EngineSQLite, false},
+		{"/path/to/archive.sqlite3", EngineSQLite, false},
 		{"invalid://uri", "", true},
 		{"", "", true},
 	}
@@ -29,6 +32,28 @@ func TestDetectEngine(t *testing.T) {
 		}
 		if got != tt.expected {
 			t.Errorf("DetectEngine(%q) = %v, want %v", tt.uri, got, tt.expected)
+		}
+	}
+}
+
+func TestParseSQLitePath(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"sqlite://./dev.db", "./dev.db"},
+		{"sqlite://path/to/test.db", "path/to/test.db"},
+		{"sqlite:///C:/data/dev.db", "C:/data/dev.db"},
+		{"./dev.db", "./dev.db"},
+		{"dev.sqlite", "dev.sqlite"},
+		{"file:memdb1?mode=memory&cache=shared", "memdb1"},
+		{"./dev.db?mode=ro", "./dev.db"},
+	}
+
+	for _, tt := range tests {
+		got := ParseSQLitePath(tt.input)
+		if got != tt.want {
+			t.Errorf("ParseSQLitePath(%q) = %q, want %q", tt.input, got, tt.want)
 		}
 	}
 }

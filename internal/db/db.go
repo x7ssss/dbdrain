@@ -9,6 +9,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
+	_ "modernc.org/sqlite"
 )
 
 // EngineType defines the underlying database dialect.
@@ -17,6 +18,7 @@ type EngineType string
 const (
 	EnginePostgres EngineType = "postgres"
 	EngineMySQL    EngineType = "mysql"
+	EngineSQLite   EngineType = "sqlite"
 )
 
 // DetectEngine automatically detects the database engine type from the connection string or URI.
@@ -27,6 +29,12 @@ func DetectEngine(connStr string) (EngineType, error) {
 	}
 	if strings.HasPrefix(s, "mysql://") || strings.HasPrefix(s, "mariadb://") {
 		return EngineMySQL, nil
+	}
+	if strings.HasPrefix(s, "sqlite://") || strings.HasPrefix(s, "file:") ||
+		strings.HasSuffix(strings.ToLower(s), ".db") ||
+		strings.HasSuffix(strings.ToLower(s), ".sqlite") ||
+		strings.HasSuffix(strings.ToLower(s), ".sqlite3") {
+		return EngineSQLite, nil
 	}
 	// Also detect standard MySQL DSN patterns (e.g. user:pass@tcp(host:port)/dbname)
 	if strings.Contains(s, "@tcp(") || strings.Contains(s, "@unix(") {
@@ -40,9 +48,11 @@ func DetectEngine(connStr string) (EngineType, error) {
 			return EnginePostgres, nil
 		case "mysql", "mariadb":
 			return EngineMySQL, nil
+		case "sqlite", "sqlite3":
+			return EngineSQLite, nil
 		}
 	}
-	return "", fmt.Errorf("unsupported database engine or URI scheme: %q (expected postgres://, postgresql://, mysql://, or mariadb://)", connStr)
+	return "", fmt.Errorf("unsupported database engine or URI scheme: %q (expected postgres://, postgresql://, mysql://, mariadb://, sqlite://, or .db/.sqlite file)", connStr)
 }
 
 // ParseMySQLDSN converts a connection string (either mysql:// URL or standard DSN)
@@ -106,6 +116,49 @@ func ParseMySQLDSN(connStr string) (dsn string, dbName string, err error) {
 	return dsn, dbName, nil
 }
 
+// ParseSQLitePath extracts the filesystem path from an SQLite URI or raw file path.
+func ParseSQLitePath(connStr string) string {
+	s := strings.TrimSpace(connStr)
+	if strings.HasPrefix(s, "sqlite://") {
+		path := strings.TrimPrefix(s, "sqlite://")
+		// On Windows, sqlite:///C:/path or sqlite://C:/path
+		if strings.HasPrefix(path, "/") && len(path) >= 3 && path[2] == ':' {
+			path = path[1:]
+		}
+		if idx := strings.Index(path, "?"); idx != -1 {
+			path = path[:idx]
+		}
+		return path
+	}
+	if strings.HasPrefix(s, "file:") {
+		path := strings.TrimPrefix(s, "file:")
+		if idx := strings.Index(path, "?"); idx != -1 {
+			path = path[:idx]
+		}
+		return path
+	}
+	if idx := strings.Index(s, "?"); idx != -1 {
+		return s[:idx]
+	}
+	return s
+}
+
+// InitSQLiteDB initializes an SQLite connection with high-performance PRAGMAs.
+func InitSQLiteDB(ctx context.Context, db *sql.DB) error {
+	pragmas := []string{
+		"PRAGMA journal_mode = WAL;",
+		"PRAGMA synchronous = OFF;",
+		"PRAGMA temp_store = MEMORY;",
+		"PRAGMA cache_size = -64000;",
+	}
+	for _, p := range pragmas {
+		if _, err := db.ExecContext(ctx, p); err != nil {
+			return fmt.Errorf("exec %s: %w", p, err)
+		}
+	}
+	return nil
+}
+
 // QuoteIdent quotes a column or table identifier for the given engine.
 func QuoteIdent(engine EngineType, name string) string {
 	if engine == EngineMySQL {
@@ -116,7 +169,7 @@ func QuoteIdent(engine EngineType, name string) string {
 
 // QuoteTable quotes a qualified or unqualified table name for the given engine.
 func QuoteTable(engine EngineType, schema, table string) string {
-	if schema == "" {
+	if engine == EngineSQLite || schema == "" {
 		return QuoteIdent(engine, table)
 	}
 	return QuoteIdent(engine, schema) + "." + QuoteIdent(engine, table)
