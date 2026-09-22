@@ -2,6 +2,7 @@ package verify
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 
@@ -53,6 +54,64 @@ WHERE c.%s IS NOT NULL AND p.%s IS NULL`,
 		err := conn.QueryRow(ctx, query).Scan(&count)
 		if err != nil {
 			// Table might not exist in target schema; skip this FK.
+			continue
+		}
+
+		if count > 0 {
+			violations = append(violations, Violation{
+				ChildTable:   fk.FromTable,
+				ChildColumn:  childCol,
+				ParentTable:  fk.ToTable,
+				ParentColumn: parentCol,
+				OrphanCount:  count,
+			})
+		}
+	}
+
+	return violations, nil
+}
+
+// RunMySQL executes orphan-check queries against a MySQL target for every FK in schema,
+// restricted to the set of tables that were actually drained.
+func RunMySQL(ctx context.Context, targetDB *sql.DB, schemaName string, schema *introspect.Schema, drained map[string]int) ([]Violation, error) {
+	var violations []Violation
+
+	quoteTable := func(table string) string {
+		if schemaName == "" {
+			return "`" + strings.ReplaceAll(table, "`", "``") + "`"
+		}
+		return "`" + strings.ReplaceAll(schemaName, "`", "``") + "`.`" + strings.ReplaceAll(table, "`", "``") + "`"
+	}
+	quoteCol := func(col string) string {
+		return "`" + strings.ReplaceAll(col, "`", "``") + "`"
+	}
+
+	for _, fk := range schema.ForeignKeys {
+		if _, ok := drained[fk.FromTable]; !ok {
+			continue
+		}
+
+		if len(fk.FromColumns) != 1 || len(fk.ToColumns) != 1 {
+			continue
+		}
+
+		childCol := fk.FromColumns[0]
+		parentCol := fk.ToColumns[0]
+
+		query := fmt.Sprintf(`
+SELECT COUNT(*)
+FROM %s c
+LEFT JOIN %s p ON p.%s = c.%s
+WHERE c.%s IS NOT NULL AND p.%s IS NULL`,
+			quoteTable(fk.FromTable),
+			quoteTable(fk.ToTable),
+			quoteCol(parentCol), quoteCol(childCol),
+			quoteCol(childCol), quoteCol(parentCol),
+		)
+
+		var count int64
+		err := targetDB.QueryRowContext(ctx, query).Scan(&count)
+		if err != nil {
 			continue
 		}
 

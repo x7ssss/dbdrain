@@ -2,7 +2,7 @@
 
 # 🚰 dbdrain
 
-**Zero-downtime PostgreSQL database subsetting, polymorphic FK resolution & deterministic PII masking — in a single static binary.**
+**Zero-downtime PostgreSQL & MySQL/MariaDB database subsetting, polymorphic FK resolution & deterministic PII masking — in a single static binary.**
 
 [![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)](https://go.dev)
 [![npm](https://img.shields.io/npm/v/dbdrain?logo=npm&color=CB3837)](https://www.npmjs.com/package/dbdrain)
@@ -21,15 +21,17 @@
 | **Snaplet** | Sunsetted in 2024 |
 | **Jailer** | Requires Java + manual YAML relationship maps |
 | **Neosync** | Heavy Docker setup, fails on circular foreign keys |
-| **pg_dump** | Full database only — no subsetting |
+| **pg_dump / mysqldump** | Full database only — no subsetting |
 
 **dbdrain** fills this void: a single Go binary, no runtime dependencies, no Docker, no YAML for basic usage.
 
+- ⚡ **Dual Engine Support** — Native support for PostgreSQL 12+ and MySQL 8.0+ / MariaDB 10.5+
+- 🔒 **Non-Locking Consistent Snapshots** — Isolation via `REPEATABLE READ READ ONLY` (Postgres) and `START TRANSACTION READ ONLY, WITH CONSISTENT SNAPSHOT` (MySQL)
+- 🔄 **Two-Phase Circular FK Resolution** — Resolves cyclic dependencies in MySQL without requiring `FOREIGN_KEY_CHECKS = 0` or deferred constraints
 - ⚡ **Zero-Copy Streaming Engine** — direct `pgx.CopyFromSource` over live cursors with `sync.Pool` buffer recycling for flat O(1) memory usage during millions of rows extractions
 - 🧠 **Smart Query Batching** — `= ANY($1::type[])` parameterized binding avoids GEQO degradation up to 10k keys; automatically promotes to `UNLOGGED` scratch tables + binary `COPY` + indexed `JOIN` for >10k keys
 - 📦 **Zero-Config npm Distribution** — run instantly with `npx dbdrain` via platform-native `optionalDependencies` binaries
 - 🔗 **Referentially intact subsets** — recursively follows every FK chain upward and downward from seed rows
-- 🔄 **Circular FK handling** — Tarjan's SCC detects cycles and emits `SET CONSTRAINTS ALL DEFERRED` automatically
 - 🌿 **Self-referencing hierarchies** — `users.manager_id → users.id`, `categories.parent_id → categories.id` resolved via recursive CTEs
 - 🧩 **Polymorphic associations** — virtual FKs for Rails-style `commentable_id` / `commentable_type` patterns
 - 🎭 **Deterministic PII masking** — HMAC-SHA256 ensures the same input always produces the same output (no UNIQUE violations)
@@ -40,6 +42,57 @@
 
 ---
 
+## Engine Compatibility Table
+
+| Capability | PostgreSQL (12+) | MySQL (8.0+) & MariaDB (10.5+) |
+|------------|------------------|--------------------------------|
+| **Connection Scheme** | `postgres://`, `postgresql://` | `mysql://`, `mariadb://`, or standard DSN |
+| **Snapshot Isolation** | `BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;` | `SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;`<br>`START TRANSACTION READ ONLY, WITH CONSISTENT SNAPSHOT;` |
+| **Circular FK Resolution** | `SET CONSTRAINTS ALL DEFERRED;` | **Two-Phase Insert Resolution** (Phase 1 NULL FK insert + Phase 2 UPDATE) |
+| **Identifier Quoting** | Double quotes (`"users"."id"`) | Backticks (`` `users`.`id` ``) |
+| **Parent/Child Batching** | `= ANY($1::type[])` (≤10k) / `UNLOGGED` temp table (>10k) | Chunked `IN (...)` queries in batches of 2,000 |
+| **Target Hydration** | Zero-copy binary `COPY FROM` stream | Transactional bulk inserts & two-phase updates |
+| **Storage Engine Inspection** | N/A (Standard PG heap) | `information_schema.TABLES` check; warns if MyISAM/MEMORY used |
+
+---
+
+## Two-Phase Circular FK Resolution (MySQL / MariaDB)
+
+PostgreSQL natively allows deferred foreign keys via `SET CONSTRAINTS ALL DEFERRED`. However, MySQL and MariaDB **do not support deferred constraints**. A common workaround is setting `FOREIGN_KEY_CHECKS = 0`, but this has serious downsides:
+1. It requires elevated administrative privileges (`SUPER` or `SYSTEM_VARIABLES_ADMIN`).
+2. It completely disables constraint validation, potentially hiding data corruption.
+3. In managed environments (AWS RDS, Aurora, Cloud SQL), changing global or session foreign key checks may be restricted or cause replication anomalies.
+
+### How dbdrain Resolves MySQL Cycles Without Disabling FK Checks:
+
+Using **Tarjan's Strongly Connected Components (SCC)** algorithm, `dbdrain` detects circular dependency loops (e.g. `users.team_id → teams.id` and `teams.lead_id → users.id`, or self-referencing `users.manager_id → users.id`).
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       Tarjan SCC Cycle                      │
+│                                                             │
+│       users (team_id [nullable]) ───► teams                 │
+│         ▲                               │                   │
+│         └─────────── lead_id ───────────┘                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+1. **Phase 1 (Safe Insert)**:
+   For every row in a cycle, any nullable foreign key pointing to a mutually dependent table within the SCC is temporarily coerced to `NULL`:
+   ```sql
+   INSERT INTO `users` (`id`, `name`, `team_id`) VALUES (10, 'Alice', NULL);
+   INSERT INTO `teams` (`id`, `title`, `lead_id`) VALUES (1, 'Core Team', 10);
+   ```
+2. **Phase 2 (Foreign Key Restoration)**:
+   Once all dependent rows in the SCC are safely inserted, `dbdrain` applies targeted `UPDATE` statements to reinstate the foreign key references:
+   ```sql
+   UPDATE `users` SET `team_id` = 1 WHERE `id` = 10;
+   ```
+
+When streaming directly to `--target` MySQL, Phase 1 inserts and Phase 2 updates are executed within the target transaction before commit.
+
+---
+
 ## Quick Start
 
 ### Run with npx (Node.js)
@@ -47,7 +100,14 @@
 No manual binary installation required:
 
 ```bash
+# PostgreSQL
 npx dbdrain --source "postgres://user:pass@prod-host/mydb" \
+            --from "users WHERE id IN (1, 2, 3) LIMIT 50" \
+            --anonymize-pii \
+            --output slice.sql
+
+# MySQL / MariaDB
+npx dbdrain --source "mysql://user:pass@prod-host:3306/mydb" \
             --from "users WHERE id IN (1, 2, 3) LIMIT 50" \
             --anonymize-pii \
             --output slice.sql
@@ -70,6 +130,10 @@ chmod +x dbdrain
 curl -L https://github.com/x7ssss/dbdrain/releases/latest/download/dbdrain-darwin-arm64 -o dbdrain
 chmod +x dbdrain
 
+# macOS (Intel)
+curl -L https://github.com/x7ssss/dbdrain/releases/latest/download/dbdrain-darwin-amd64 -o dbdrain
+chmod +x dbdrain
+
 # Windows (PowerShell)
 Invoke-WebRequest https://github.com/x7ssss/dbdrain/releases/latest/download/dbdrain-windows-amd64.exe -OutFile dbdrain.exe
 ```
@@ -86,7 +150,7 @@ go build -o dbdrain ./cmd/dbdrain/
 
 ## Usage Examples
 
-### 1. Slice to SQL file (with PII masking)
+### 1. Slice PostgreSQL to SQL file (with PII masking)
 
 ```bash
 dbdrain \
@@ -97,20 +161,38 @@ dbdrain \
   --output slice.sql
 ```
 
-### 2. Pipe directly into psql (non-TTY: zero ANSI noise)
+### 2. Slice MySQL to SQL file with Two-Phase Cycle Resolution
 
 ```bash
+dbdrain \
+  --source "mysql://root:secret@prod-host:3306/shop" \
+  --from "orders WHERE created_at > '2026-01-01' LIMIT 100" \
+  --anonymize-pii \
+  --output slice.sql
+```
+
+### 3. Pipe directly into target DB (non-TTY: zero ANSI noise)
+
+```bash
+# PostgreSQL
 dbdrain \
   --source "postgres://user:pass@prod-host/mydb" \
   --from "orders WHERE created_at > NOW() - INTERVAL '30 days' LIMIT 200" \
   | psql postgres://user:pass@staging-host/stagingdb
+
+# MySQL
+dbdrain \
+  --source "mysql://user:pass@prod-host:3306/mydb" \
+  --from "orders WHERE created_at > '2026-01-01' LIMIT 200" \
+  | mysql -u user -p -h staging-host stagingdb
 ```
 
-### 3. Direct streaming hydration with integrity check
+### 4. Direct streaming hydration with integrity check
 
-Streams directly from source PostgreSQL into target PostgreSQL with **zero disk writes** and **flat O(1) memory consumption**:
+Streams directly from source database into target database with **zero disk writes**:
 
 ```bash
+# PostgreSQL to PostgreSQL
 dbdrain \
   --source "postgres://user:pass@prod-host/mydb" \
   --from "users WHERE plan = 'enterprise' LIMIT 100" \
@@ -119,9 +201,19 @@ dbdrain \
   --depth 2 \
   --max-rows-per-table 500 \
   --verify
+
+# MySQL to MySQL
+dbdrain \
+  --source "mysql://root:secret@prod-host:3306/mydb" \
+  --from "users WHERE plan = 'enterprise' LIMIT 100" \
+  --target "mysql://root:secret@localhost:3306/staging" \
+  --anonymize-pii \
+  --depth 2 \
+  --max-rows-per-table 500 \
+  --verify
 ```
 
-### 4. Declarative config with polymorphic FKs
+### 5. Declarative config with polymorphic FKs
 
 ```bash
 dbdrain \
@@ -138,64 +230,17 @@ dbdrain \
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--source` | string | **required** | Source PostgreSQL connection string |
+| `--source` | string | **required** | Source database connection string (`postgres://`, `mysql://`, `mariadb://`) |
 | `--from` | string | **required** | Anchor query: `"<table> [WHERE <clause>] [LIMIT <n>]"` |
 | `--output` | string | `-` (stdout) | Output SQL file path (`-` = stdout) |
-| `--schema` | string | `public` | PostgreSQL schema to operate on |
+| `--schema` | string | `public` (PG) / DSN db (MySQL) | Schema or database name to operate on |
 | `--anonymize-pii` | bool | `false` | Enable deterministic PII masking |
 | `--salt` | string | `dbdrain-secret-salt` | HMAC salt for reproducible masking |
 | `--depth` | int | `0` (unlimited) | Max downward FK traversal depth (parents always unlimited) |
 | `--max-rows-per-table` | int | `0` (unlimited) | Hard ceiling on rows pulled per child table |
-| `--target` | string | — | Target DB for direct streaming hydration (bypasses `--output`) |
+| `--target` | string | — | Target DB connection string for direct hydration (bypasses `--output`) |
 | `--config` | string | `dbdrain.yaml` (auto) | Path to declarative config file |
 | `--verify` | bool | `false` | Run post-hydration orphan integrity checks (requires `--target`) |
-
----
-
-## Streaming Engine & Query Planner (v0.4.0)
-
-### 1. Zero-Copy `pgx.CopyFromSource` Architecture
-
-When `--target` is specified, `dbdrain` does not buffer records into memory (`[]Row` or `[][]any`). Instead, it wires a custom `CursorCopySource` directly between the source cursor and the target PostgreSQL binary COPY stream:
-
-```
-Source Postgres (Snapshot Tx)
-      │
-      ▼  (wire protocol rows)
-pgx.Rows Cursor
-      │
-      ▼  (row-by-row)
-CursorCopySource (implements pgx.CopyFromSource)
-      ├── sync.Pool buffer recycling (0 allocations per row)
-      ├── In-place HMAC deterministic PII masking
-      └── Real-time progress metric callbacks
-      │
-      ▼  (binary COPY stream)
-Target Postgres (targetTx.CopyFrom with DEFERRED constraints)
-```
-
-- **O(1) Heap Memory**: Regardless of whether you extract 10 rows or 10,000,000 rows, memory consumption remains flat.
-- **Pooled Buffers**: Slice buffers are recycled through `sync.Pool` and zeroed out for GC safety.
-
-### 2. Parameterized Array Query Batching (`= ANY($1)`)
-
-When resolving parent and child relationships across tables, dbdrain avoids naive `WHERE col IN (...)` query generation:
-
-- **1 to 10,000 keys**: Queries are compiled into parameterized array lookups:
-  ```sql
-  SELECT "id", "user_id", "total"
-  FROM "public"."orders"
-  WHERE "user_id" = ANY($1::bigint[]);
-  ```
-  `$1` is passed as a typed native array (`[]int64`, `[]string`), preserving server-side prepared statement cache hits and avoiding Genetic Query Optimizer (GEQO) threshold triggers.
-
-- **> 10,000 keys**: To avoid query text explosion and memory limits, keys are streamed into an `UNLOGGED` temporary scratch table via binary COPY:
-  ```sql
-  CREATE TEMP TABLE "_dbdrain_k_orders" (key text PRIMARY KEY) ON COMMIT DROP;
-  -- Stream parent keys via COPY ...
-  SELECT t.* FROM "public"."orders" t
-  INNER JOIN "_dbdrain_k_orders" k ON k.key = t."user_id"::text;
-  ```
 
 ---
 
@@ -279,11 +324,17 @@ When `--anonymize-pii` is enabled and no config rule matches, columns are auto-m
 When `--verify` is combined with `--target`, dbdrain runs orphan-check queries on the target database after loading:
 
 ```sql
--- Generated per FK relationship:
+-- Generated per FK relationship (PostgreSQL):
 SELECT COUNT(*)
 FROM public.comments c
 LEFT JOIN public.posts p ON p.id = c.post_id
 WHERE c.post_id IS NOT NULL AND p.id IS NULL;
+
+-- Generated per FK relationship (MySQL):
+SELECT COUNT(*)
+FROM `mydb`.`comments` c
+LEFT JOIN `mydb`.`posts` p ON p.`id` = c.`post_id`
+WHERE c.`post_id` IS NOT NULL AND p.`id` IS NULL;
 ```
 
 **TTY output (success):**
@@ -305,33 +356,36 @@ WHERE c.post_id IS NOT NULL AND p.id IS NULL;
 ```
 dbdrain --from "users WHERE id=1"
     │
+    ├─ internal/db/
+    │    ├─ DetectEngine (postgres:// vs mysql:// vs mariadb://)
+    │    ├─ SourceDB & SourceTx abstractions (Postgres pgx vs MySQL database/sql)
+    │    └─ Non-locking snapshots: REPEATABLE READ & START TRANSACTION WITH CONSISTENT SNAPSHOT
+    │
     ├─ internal/config/config.go
     │    └─ Loads dbdrain.yaml: masking rules, virtual FK declarations
-    │       Priority-based wildcard FindRule (exact > glob)
     │
-    ├─ internal/introspect/postgres.go
-    │    └─ Queries information_schema + pg_constraint
-    │       Discovers columns, PKs, composite FKs, deferrability
+    ├─ internal/introspect/
+    │    ├─ postgres.go: information_schema + pg_constraint catalog query
+    │    └─ mysql.go: information_schema TABLES/COLUMNS/KEY_COLUMN_USAGE catalog query
+    │                 warns on non-transactional/non-FK engines (MyISAM, MEMORY)
+    │                 strictly preserves compound FK column ordering by ORDINAL_POSITION
     │
-    ├─ internal/graph/graph.go & internal/graph/query.go
-    │    ├─ Builds directed adjacency-list FK graph
-    │    ├─ Registers virtual FK edges from config
-    │    └─ Query planner: BuildANYQuery (= ANY($1::type[])), BuildTempTableJoinQuery
-    │
-    ├─ internal/graph/tarjan.go
-    │    └─ Tarjan's SCC → detects circular FK dependencies
-    │       Emits SET CONSTRAINTS ALL DEFERRED when cycles found
+    ├─ internal/graph/
+    │    ├─ graph.go & query.go: Directed adjacency-list FK graph
+    │    └─ tarjan.go: Tarjan's SCC algorithm for cycle detection
     │
     ├─ internal/drain/
-    │    ├─ export.go: REPEATABLE READ snapshot, CTE self-ref, BFS upward/downward
-    │    ├─ batcher.go: Query planner router (ANY($1) array vs UNLOGGED temp table COPY + JOIN)
-    │    └─ copy_source.go: CursorCopySource (pgx.CopyFromSource) + sync.Pool O(1) buffer recycling
+    │    ├─ export.go: Consistent snapshot traversal, recursive CTE self-ref, BFS upward/downward
+    │    ├─ twophase.go: Two-Phase Insert Resolution for MySQL (Phase 1 NULL insert, Phase 2 UPDATE)
+    │    ├─ format.go: Engine-specific SQL literal formatting (backticks, booleans, dates, binary)
+    │    ├─ batcher.go: Query batcher router (ANY($1) array / temp table for PG, chunked IN for MySQL)
+    │    └─ copy_source.go: CursorCopySource (pgx.CopyFromSource) + sync.Pool buffer recycling
     │
     ├─ internal/anonymize/mask.go
     │    └─ HMAC-SHA256 masking: fake_email, redact, uuid_remap, hmac_phone, hmac_name, hmac_token
     │
     ├─ internal/verify/verify.go
-    │    └─ LEFT JOIN orphan queries on target DB; exits 1 on violations
+    │    └─ LEFT JOIN orphan checks on target DB (Postgres pgx & MySQL database/sql); exits 1 on violations
     │
     └─ npm/
          ├─ dbdrain/ (runner.cjs: cross-platform binary launcher for npx/npm)
@@ -343,19 +397,28 @@ dbdrain --from "users WHERE id=1"
 ## Development
 
 ```bash
-# Run all tests (71 tests across 6 packages)
+# Run all tests
 go test ./...
 
 # Cross-compile release binaries
-GOOS=linux   GOARCH=amd64  CGO_ENABLED=0 go build -o dist/dbdrain-linux-amd64   ./cmd/dbdrain/
-GOOS=darwin  GOARCH=arm64  CGO_ENABLED=0 go build -o dist/dbdrain-darwin-arm64  ./cmd/dbdrain/
-GOOS=darwin  GOARCH=amd64  CGO_ENABLED=0 go build -o dist/dbdrain-darwin-amd64  ./cmd/dbdrain/
-GOOS=windows GOARCH=amd64  CGO_ENABLED=0 go build -o dist/dbdrain-windows-amd64.exe ./cmd/dbdrain/
+GOOS=linux   GOARCH=amd64  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/dbdrain-linux-amd64   ./cmd/dbdrain/
+GOOS=darwin  GOARCH=arm64  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/dbdrain-darwin-arm64  ./cmd/dbdrain/
+GOOS=darwin  GOARCH=amd64  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/dbdrain-darwin-amd64  ./cmd/dbdrain/
+GOOS=windows GOARCH=amd64  CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/dbdrain-windows-amd64.exe ./cmd/dbdrain/
 ```
 
 ---
 
 ## Changelog
+
+### v0.5.0
+- 🐬 **Native MySQL 8.0+ & MariaDB 10.5+ Support**: Auto-detects engine type from URI scheme (`mysql://`, `mariadb://`) or standard DSN strings.
+- 📸 **Non-Locking Consistent Snapshots**: Acquires extraction transactions with `SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ` and `START TRANSACTION READ ONLY, WITH CONSISTENT SNAPSHOT` without locking reads.
+- 🔄 **Two-Phase Circular FK Resolution**: Resolves cyclic SCC clusters without deferred constraints or dangerous `FOREIGN_KEY_CHECKS = 0` by emitting Phase 1 NULL FK inserts followed by Phase 2 updates.
+- 🔍 **Catalog Introspection**: Queries `information_schema` for storage engines, columns, primary keys, and compound foreign keys, strictly preserving compound FK ordering by `ORDINAL_POSITION`.
+- ⚠️ **Storage Engine Safeguards**: Warns when encountering non-transactional / non-FK storage engines like MyISAM or MEMORY.
+- 🔤 **Dialect Formatting**: Full backtick identifier escaping and MySQL-compliant literals for booleans, dates, binary, and JSON types.
+- 🚀 **Dual-Engine Direct Target Hydration & Integrity Verification**: Hydrate and verify orphan integrity seamlessly across both PostgreSQL and MySQL targets.
 
 ### v0.4.0
 - ⚡ **Zero-Copy Streaming Hydration**: Refactored `ExportToTarget()` with `pgx.CopyFromSource` and `sync.Pool` buffer recycling for flat O(1) memory usage during millions of rows extractions.

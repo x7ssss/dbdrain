@@ -1,6 +1,6 @@
 {
   "name": "@x7ssss/dbdrain-linux-x64",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "dbdrain native binary for Linux x64",
   "os": [
     "linux"

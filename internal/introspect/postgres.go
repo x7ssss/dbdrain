@@ -28,16 +28,24 @@ type ForeignKey struct {
 
 // Schema holds the full introspected schema for a given schema name.
 type Schema struct {
-	Columns     map[string][]Column    // table -> columns
-	PrimaryKeys map[string][]string    // table -> pk column names
-	ForeignKeys []ForeignKey
+	Columns      map[string][]Column // table -> columns
+	PrimaryKeys  map[string][]string // table -> pk column names
+	ForeignKeys  []ForeignKey
+	TableEngines map[string]string // table -> storage engine (e.g. InnoDB, MyISAM)
+	Warnings     []string          // introspection warnings
 }
 
 // Load introspects the PostgreSQL schema using information_schema and pg_constraint.
 func Load(ctx context.Context, conn *pgx.Conn, schemaName string) (*Schema, error) {
+	return LoadPostgres(ctx, conn, schemaName)
+}
+
+// LoadPostgres introspects the PostgreSQL schema using information_schema and pg_constraint.
+func LoadPostgres(ctx context.Context, conn *pgx.Conn, schemaName string) (*Schema, error) {
 	s := &Schema{
-		Columns:     make(map[string][]Column),
-		PrimaryKeys: make(map[string][]string),
+		Columns:      make(map[string][]Column),
+		PrimaryKeys:  make(map[string][]string),
+		TableEngines: make(map[string]string),
 	}
 
 	// Load columns

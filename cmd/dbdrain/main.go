@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/spf13/cobra"
 	"github.com/x7ssss/dbdrain/internal/config"
+	"github.com/x7ssss/dbdrain/internal/db"
 	"github.com/x7ssss/dbdrain/internal/drain"
 	"github.com/x7ssss/dbdrain/internal/graph"
 	"github.com/x7ssss/dbdrain/internal/introspect"
@@ -21,7 +23,7 @@ import (
 	"github.com/x7ssss/dbdrain/internal/verify"
 )
 
-const version = "v0.4.0"
+const version = "v0.5.0"
 
 var (
 	source          string
@@ -39,20 +41,21 @@ var (
 
 var rootCmd = &cobra.Command{
 	Use:   "dbdrain",
-	Short: "High-performance PostgreSQL database slicer and PII anonymizer",
+	Short: "High-performance PostgreSQL & MySQL/MariaDB database slicer and PII anonymizer",
 	Long: `dbdrain ` + version + ` extracts referentially intact subsets from a production
-PostgreSQL database, resolves circular FK dependencies, handles polymorphic
-associations, and deterministically masks PII.
+PostgreSQL or MySQL/MariaDB database, resolves circular FK dependencies (including
+two-phase insert/update resolution for MySQL), handles polymorphic associations,
+and deterministically masks PII.
 
 Examples:
   # Stream slice to stdout and pipe directly into psql
   dbdrain --source "postgres://user:pass@localhost/prod" \
           --from "users WHERE id IN (1,2,3) LIMIT 50" | psql postgres://localhost/staging
 
-  # Save to file with PII masking and declarative config rules
-  dbdrain --source "postgres://user:pass@localhost/prod" \
-          --from "orders WHERE created_at > NOW() - INTERVAL '7 days' LIMIT 100" \
-          --anonymize-pii --config dbdrain.yaml --output slice.sql
+  # Export MySQL slice to SQL file with two-phase circular resolution
+  dbdrain --source "mysql://root:secret@localhost:3306/shop" \
+          --from "orders WHERE created_at > '2026-01-01' LIMIT 100" \
+          --anonymize-pii --output slice.sql
 
   # Stream directly into a target database with integrity check
   dbdrain --source "postgres://user:pass@localhost/prod" \
@@ -63,15 +66,15 @@ Examples:
 }
 
 func init() {
-	rootCmd.Flags().StringVar(&source, "source", "", "Source PostgreSQL connection string (required)")
+	rootCmd.Flags().StringVar(&source, "source", "", "Source database connection string (PostgreSQL or MySQL/MariaDB) (required)")
 	rootCmd.Flags().StringVar(&fromExpr, "from", "", `Anchor query, e.g. "users WHERE id IN (1,2,3) LIMIT 50" (required)`)
 	rootCmd.Flags().StringVar(&output, "output", "-", "Output file path (default: stdout)")
-	rootCmd.Flags().StringVar(&schemaName, "schema", "public", "Target schema name")
+	rootCmd.Flags().StringVar(&schemaName, "schema", "public", "Target schema/database name")
 	rootCmd.Flags().BoolVar(&anonymize, "anonymize-pii", false, "Enable deterministic PII masking")
 	rootCmd.Flags().StringVar(&salt, "salt", "dbdrain-secret-salt", "Salt for deterministic HMAC masking")
 	rootCmd.Flags().IntVar(&maxRowsPerTable, "max-rows-per-table", 0, "Hard cap on rows pulled per child table (0 = unlimited)")
 	rootCmd.Flags().IntVar(&maxDepth, "depth", 0, "Max FK traversal depth for child tables (0 = unlimited; parents always fully resolved)")
-	rootCmd.Flags().StringVar(&target, "target", "", "Target PostgreSQL connection string for direct hydration (bypasses --output)")
+	rootCmd.Flags().StringVar(&target, "target", "", "Target database connection string for direct hydration (bypasses --output)")
 	rootCmd.Flags().StringVar(&configPath, "config", "", "Path to dbdrain.yaml config file (auto-detected if omitted)")
 	rootCmd.Flags().BoolVar(&doVerify, "verify", false, "Run post-hydration orphan integrity checks on --target (requires --target)")
 
@@ -154,21 +157,63 @@ func runDrain(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	sourceEngine, err := db.DetectEngine(source)
+	if err != nil {
+		return fmt.Errorf("detect source engine: %w", err)
+	}
+
 	spinnerMsg("Connecting to source database...")
 
-	conn, err := pgx.Connect(ctx, source)
-	if err != nil {
-		stopSpinner()
-		return fmt.Errorf("connect to source: %w", err)
-	}
-	defer conn.Close(ctx)
+	var sourceDB db.SourceDB
+	var schema *introspect.Schema
+	effectiveSchema := schemaName
 
-	spinnerMsg("Introspecting schema...")
+	if sourceEngine == db.EngineMySQL {
+		dsn, dbName, err := db.ParseMySQLDSN(source)
+		if err != nil {
+			stopSpinner()
+			return fmt.Errorf("parse mysql source: %w", err)
+		}
+		if !cmd.Flags().Changed("schema") && dbName != "" {
+			effectiveSchema = dbName
+		}
 
-	schema, err := introspect.Load(ctx, conn, schemaName)
-	if err != nil {
-		stopSpinner()
-		return fmt.Errorf("introspect schema: %w", err)
+		sqlDB, err := sql.Open("mysql", dsn)
+		if err != nil {
+			stopSpinner()
+			return fmt.Errorf("connect to mysql source: %w", err)
+		}
+		defer sqlDB.Close()
+
+		if err := sqlDB.PingContext(ctx); err != nil {
+			stopSpinner()
+			return fmt.Errorf("ping mysql source: %w", err)
+		}
+
+		sourceDB = db.NewMySQLSource(sqlDB)
+
+		spinnerMsg("Introspecting MySQL schema...")
+		schema, err = introspect.LoadMySQL(ctx, sqlDB, effectiveSchema)
+		if err != nil {
+			stopSpinner()
+			return fmt.Errorf("introspect mysql schema: %w", err)
+		}
+	} else {
+		conn, err := pgx.Connect(ctx, source)
+		if err != nil {
+			stopSpinner()
+			return fmt.Errorf("connect to source: %w", err)
+		}
+		defer conn.Close(ctx)
+
+		sourceDB = db.NewPostgresSource(conn)
+
+		spinnerMsg("Introspecting PostgreSQL schema...")
+		schema, err = introspect.LoadPostgres(ctx, conn, effectiveSchema)
+		if err != nil {
+			stopSpinner()
+			return fmt.Errorf("introspect schema: %w", err)
+		}
 	}
 
 	// Convert config virtual FKs → graph.VirtualFKInput.
@@ -186,7 +231,7 @@ func runDrain(cmd *cobra.Command, args []string) error {
 	sccs := graph.TarjanSCC(g)
 
 	drainCfg := drain.Config{
-		Schema:          schemaName,
+		Schema:          effectiveSchema,
 		AnonymizePII:    anonymize,
 		Salt:            salt,
 		MaxRowsPerTable: maxRowsPerTable,
@@ -194,22 +239,18 @@ func runDrain(cmd *cobra.Command, args []string) error {
 		Rules:           cfg.Rules,
 	}
 
-	exporter := drain.New(conn, schema, g, sccs, drainCfg)
+	exporter := drain.New(sourceDB, schema, g, sccs, drainCfg)
 
 	// ---- Direct target hydration mode ----
 	if target != "" {
-		spinnerMsg("Connecting to target database...")
-		targetConn, err := pgx.Connect(ctx, target)
+		targetEngine, err := db.DetectEngine(target)
 		if err != nil {
 			stopSpinner()
-			return fmt.Errorf("connect to target: %w", err)
+			return fmt.Errorf("detect target engine: %w", err)
 		}
-		defer targetConn.Close(ctx)
 
 		var mu sync.Mutex
 		rowsStreamed := make(map[string]int)
-
-		spinnerMsg(fmt.Sprintf("Streaming '%s' → target...", anchorTable))
 
 		progressFn := func(tbl string, n int) {
 			mu.Lock()
@@ -224,28 +265,88 @@ func runDrain(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		if err := exporter.ExportToTarget(ctx, targetConn, anchorTable, anchorWhere, anchorLimit, progressFn); err != nil {
-			stopSpinner()
-			return fmt.Errorf("stream to target: %w", err)
-		}
-
-		// Post-hydration integrity verification.
 		var uiViolations []ui.Violation
-		if doVerify {
-			spinnerMsg("Running integrity checks...")
-			violations, verifyErr := verify.Run(ctx, targetConn, schemaName, schema, exporter.RowCounts)
-			if verifyErr != nil {
+
+		if targetEngine == db.EngineMySQL {
+			spinnerMsg("Connecting to target MySQL database...")
+			targetDSN, targetDBName, err := db.ParseMySQLDSN(target)
+			if err != nil {
 				stopSpinner()
-				return fmt.Errorf("integrity check: %w", verifyErr)
+				return fmt.Errorf("parse target mysql DSN: %w", err)
 			}
-			for _, v := range violations {
-				uiViolations = append(uiViolations, ui.Violation{
-					ChildTable:   v.ChildTable,
-					ChildColumn:  v.ChildColumn,
-					ParentTable:  v.ParentTable,
-					ParentColumn: v.ParentColumn,
-					OrphanCount:  v.OrphanCount,
-				})
+			targetSchema := effectiveSchema
+			if targetDBName != "" {
+				targetSchema = targetDBName
+			}
+
+			targetDB, err := sql.Open("mysql", targetDSN)
+			if err != nil {
+				stopSpinner()
+				return fmt.Errorf("connect to target mysql: %w", err)
+			}
+			defer targetDB.Close()
+
+			if err := targetDB.PingContext(ctx); err != nil {
+				stopSpinner()
+				return fmt.Errorf("ping target mysql: %w", err)
+			}
+
+			spinnerMsg(fmt.Sprintf("Streaming '%s' → target MySQL...", anchorTable))
+			if err := exporter.ExportToTargetMySQL(ctx, targetDB, targetSchema, anchorTable, anchorWhere, anchorLimit, progressFn); err != nil {
+				stopSpinner()
+				return fmt.Errorf("stream to target mysql: %w", err)
+			}
+
+			// Post-hydration integrity verification.
+			if doVerify {
+				spinnerMsg("Running integrity checks on MySQL target...")
+				violations, verifyErr := verify.RunMySQL(ctx, targetDB, targetSchema, schema, exporter.RowCounts)
+				if verifyErr != nil {
+					stopSpinner()
+					return fmt.Errorf("integrity check: %w", verifyErr)
+				}
+				for _, v := range violations {
+					uiViolations = append(uiViolations, ui.Violation{
+						ChildTable:   v.ChildTable,
+						ChildColumn:  v.ChildColumn,
+						ParentTable:  v.ParentTable,
+						ParentColumn: v.ParentColumn,
+						OrphanCount:  v.OrphanCount,
+					})
+				}
+			}
+		} else {
+			spinnerMsg("Connecting to target PostgreSQL database...")
+			targetConn, err := pgx.Connect(ctx, target)
+			if err != nil {
+				stopSpinner()
+				return fmt.Errorf("connect to target: %w", err)
+			}
+			defer targetConn.Close(ctx)
+
+			spinnerMsg(fmt.Sprintf("Streaming '%s' → target...", anchorTable))
+			if err := exporter.ExportToTarget(ctx, targetConn, anchorTable, anchorWhere, anchorLimit, progressFn); err != nil {
+				stopSpinner()
+				return fmt.Errorf("stream to target: %w", err)
+			}
+
+			// Post-hydration integrity verification.
+			if doVerify {
+				spinnerMsg("Running integrity checks...")
+				violations, verifyErr := verify.Run(ctx, targetConn, effectiveSchema, schema, exporter.RowCounts)
+				if verifyErr != nil {
+					stopSpinner()
+					return fmt.Errorf("integrity check: %w", verifyErr)
+				}
+				for _, v := range violations {
+					uiViolations = append(uiViolations, ui.Violation{
+						ChildTable:   v.ChildTable,
+						ChildColumn:  v.ChildColumn,
+						ParentTable:  v.ParentTable,
+						ParentColumn: v.ParentColumn,
+						OrphanCount:  v.OrphanCount,
+					})
+				}
 			}
 		}
 
